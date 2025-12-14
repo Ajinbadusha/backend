@@ -15,6 +15,7 @@ from sqlalchemy.orm import sessionmaker, relationship
 from datetime import datetime
 import os
 
+# Use DATABASE_URL from environment (Render) or a local default
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
     "postgresql://crawler:crawler_demo_pass@localhost:5432/ecommerce_db",
@@ -23,6 +24,7 @@ DATABASE_URL = os.getenv(
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
+
 
 # TABLE 1: Jobs
 class Job(Base):
@@ -111,14 +113,14 @@ class ProductEnrichment(Base):
     product = relationship("Product", back_populates="enrichment")
 
 
-# TABLE 6: Product Vectors (embeddings stored as JSON, not pgvector)
+# TABLE 6: Product Vectors (embeddings stored as JSON, no pgvector)
 class ProductVector(Base):
     __tablename__ = "product_vectors"
 
     id = Column(String, primary_key=True)
-    product_id = Column(String, ForeignKey("products.id"), unique=True)
-    # previously: embedding = Column(Vector(1536))
-    embedding = Column(JSON)  # list of floats stored as JSON
+    product_id = Column(String, ForeignKey("products.id"), unique=True, index=True)
+    # store the embedding as a JSON array of floats instead of VECTOR(1536)
+    embedding = Column(JSON, nullable=True)
 
     product = relationship("Product", back_populates="vector")
 
@@ -129,7 +131,7 @@ def init_db():
 
 
 def get_db():
-    """Get database session."""
+    """Yield a database session (FastAPI dependency)."""
     db = SessionLocal()
     try:
         yield db
