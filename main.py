@@ -86,7 +86,7 @@ async def websocket_endpoint(websocket: WebSocket, job_id: str):
     """
     WebSocket for live job status.
 
-    Client connects to: /ws?job_id=...
+    Client connects to: /ws?job_id=<job_uuid>
     """
     await websocket.accept()
 
@@ -112,7 +112,8 @@ async def websocket_endpoint(websocket: WebSocket, job_id: str):
 
             await asyncio.sleep(2)  # update every 2 seconds
     except WebSocketDisconnect:
-        connections[job_id].remove(websocket)
+        if job_id in connections and websocket in connections[job_id]:
+            connections[job_id].remove(websocket)
 
 
 async def broadcast_status(job_id: str, db: Session):
