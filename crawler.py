@@ -9,7 +9,7 @@ so it works on hosts where Playwright browsers cannot run.
 import json
 import re
 from typing import List, Dict, Set
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
@@ -37,7 +37,7 @@ class UniversalCrawler:
         """Main crawl method - returns list of product data dicts."""
         products: List[Dict] = []
 
-        # STEP 1: Discover product URLs (basic pagination via query params or links)
+        # STEP 1: Discover product URLs (basic pagination via links)
         await self._discover_products(start_url)
 
         # STEP 2: Extract data from each product
@@ -52,11 +52,11 @@ class UniversalCrawler:
 
     async def _discover_products(self, listing_url: str):
         """
-        SOW 2.3.A - Find product URLs using hybrid strategy, but via static HTML only.
+        SOW 2.3.A - Find product URLs using hybrid strategy, via static HTML only.
         """
         current_url = listing_url
 
-        for page_num in range(min(3, self.max_pages)):
+        for _ in range(min(3, self.max_pages)):
             if current_url in self.visited_urls:
                 break
             self.visited_urls.add(current_url)
@@ -232,7 +232,6 @@ class UniversalCrawler:
                 "images": obj.get("images") or obj.get("image_urls") or [],
             }
             if result["title"]:
-                # Coerce price to float if possible
                 price = result["price"]
                 try:
                     result["price"] = float(price) if price is not None else None

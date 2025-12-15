@@ -28,3 +28,7 @@ pydantic==2.9.2
 # Utilities
 python-dotenv==1.0.1
 
+
+uvicorn[standard]==0.30.6
+websockets==12.0
+
