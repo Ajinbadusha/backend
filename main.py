@@ -2,6 +2,11 @@
 FastAPI Backend - REST API + WebSocket
 """
 
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket, job_id: str):
+    ...
+
+
 import os
 import uuid
 from datetime import datetime
