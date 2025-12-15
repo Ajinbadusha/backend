@@ -137,7 +137,6 @@ async def broadcast_status(job_id: str, db: Session):
         try:
             await ws.send_json(payload)
         except Exception:
-            # Drop broken sockets silently
             try:
                 connections[job_id].remove(ws)
             except ValueError:
@@ -175,7 +174,6 @@ async def create_job(
     db.add(job)
     db.commit()
 
-    # Queue the crawl task (FastAPI background task for demo)
     background_tasks.add_task(
         crawl_and_process, job_id, job_request.url, job_request.options
     )
@@ -344,7 +342,6 @@ async def crawl_and_process(job_id: str, url: str, options: Dict):
             db.commit()
             await broadcast_status(job_id, db)
 
-            # Demo: pretend 3 images per product
             job.counters["images_downloaded"] = len(products_data) * 3
             db.commit()
             await broadcast_status(job_id, db)
@@ -373,7 +370,6 @@ async def crawl_and_process(job_id: str, url: str, options: Dict):
                 db.add(product)
                 db.commit()
 
-                # Add up to 3 images
                 for i, img_url in enumerate(prod_data.get("images", [])[:3]):
                     img_obj = ProductImage(
                         id=str(uuid.uuid4()),
