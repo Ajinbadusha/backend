@@ -2,11 +2,6 @@
 FastAPI Backend - REST API + WebSocket
 """
 
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket, job_id: str):
-    ...
-
-
 import os
 import uuid
 from datetime import datetime
@@ -86,13 +81,12 @@ class ProductResponse(BaseModel):
     source_url: str
 
 
-@app.websocket("/ws/{job_id}")
+@app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket, job_id: str):
     """
     WebSocket for live job status.
 
-    NOTE: We open a fresh DB session inside the loop instead of using Depends,
-    to avoid stale sessions in long‑lived connections.
+    Client connects to: /ws?job_id=...
     """
     await websocket.accept()
 
@@ -181,7 +175,9 @@ async def create_job(
     db.commit()
 
     # Queue the crawl task (FastAPI background task for demo)
-    background_tasks.add_task(crawl_and_process, job_id, job_request.url, job_request.options)
+    background_tasks.add_task(
+        crawl_and_process, job_id, job_request.url, job_request.options
+    )
 
     return {
         "job_id": job_id,
