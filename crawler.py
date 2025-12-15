@@ -1,242 +1,293 @@
 """
 Universal Ecommerce Crawler
-Handles: pagination, infinite scroll, product discovery, extraction
+Handles: pagination, product discovery, extraction
+
+This version uses plain HTTP requests + BeautifulSoup only,
+so it works on hosts where Playwright browsers cannot run.
 """
 
-import asyncio
-from playwright.async_api import async_playwright, Browser, Page as PlaywrightPage
-from bs4 import BeautifulSoup
 import json
 import re
 from typing import List, Dict, Set
 from urllib.parse import urljoin, urlparse
-import hashlib
+
+import requests
+from bs4 import BeautifulSoup
 
 
 class UniversalCrawler:
     """Crawl any ecommerce site using hybrid extraction strategy"""
-    
+
     def __init__(self, max_pages: int = 10, max_products: int = 50, headless: bool = True):
         self.max_pages = max_pages
         self.max_products = max_products
-        self.headless = headless
+        self.headless = headless  # kept for compatibility, but unused
         self.visited_urls: Set[str] = set()
         self.product_urls: Set[str] = set()
-        self.browser: Browser = None
-        self.page: PlaywrightPage = None
-        
+
     async def start(self):
-        """Initialize browser"""
-        playwright = await async_playwright().start()
-        self.browser = await playwright.chromium.launch(headless=self.headless)
-        self.page = await self.browser.new_page()
-        self.page.set_default_timeout(10000)
-        
+        """Kept for backwards compatibility (no-op for requests-based crawler)."""
+        return
+
     async def stop(self):
-        """Close browser"""
-        if self.browser:
-            await self.browser.close()
-    
+        """Kept for backwards compatibility (no-op for requests-based crawler)."""
+        return
+
     async def crawl(self, start_url: str) -> List[Dict]:
-        """Main crawl method - returns list of product URLs and data"""
-        await self.start()
-        products = []
-        
-        try:
-            # STEP 1: Discover product URLs
-            await self._discover_products(start_url)
-            
-            # STEP 2: Extract data from each product
-            for i, product_url in enumerate(list(self.product_urls)[:self.max_products]):
-                product_data = await self._extract_product(product_url)
-                if product_data:
-                    products.append(product_data)
-                if i + 1 >= self.max_products:
-                    break
-        finally:
-            await self.stop()
-        
+        """Main crawl method - returns list of product data dicts."""
+        products: List[Dict] = []
+
+        # STEP 1: Discover product URLs (basic pagination via query params or links)
+        await self._discover_products(start_url)
+
+        # STEP 2: Extract data from each product
+        for i, product_url in enumerate(list(self.product_urls)[: self.max_products]):
+            product_data = await self._extract_product(product_url)
+            if product_data:
+                products.append(product_data)
+            if i + 1 >= self.max_products:
+                break
+
         return products
-    
+
     async def _discover_products(self, listing_url: str):
-        """SOW 2.3.A - Find product URLs using hybrid strategy"""
-        await self.page.goto(listing_url)
-        
-        # Handle pagination (demo: max 3 pages)
+        """
+        SOW 2.3.A - Find product URLs using hybrid strategy, but via static HTML only.
+        """
+        current_url = listing_url
+
         for page_num in range(min(3, self.max_pages)):
-            await self._extract_links_from_page()
-            
-            # Try to find next page link
-            next_button = await self.page.query_selector('a[rel="next"]') or \
-                         await self.page.query_selector('button:has-text("Next")') or \
-                         await self.page.query_selector('[aria-label="Next"]')
-            
-            if next_button:
-                await next_button.click()
-                await self.page.wait_for_load_state('networkidle')
+            if current_url in self.visited_urls:
+                break
+            self.visited_urls.add(current_url)
+
+            resp = requests.get(current_url, timeout=20)
+            resp.raise_for_status()
+            soup = BeautifulSoup(resp.text, "html.parser")
+
+            self._extract_links_from_page_soup(soup, current_url)
+
+            # Try to find "next" link for pagination
+            next_link = (
+                soup.select_one('a[rel="next"]')
+                or soup.find("a", string=re.compile(r"next", re.I))
+                or soup.find("button", string=re.compile(r"next", re.I))
+            )
+            if next_link and next_link.get("href"):
+                current_url = urljoin(current_url, next_link["href"])
             else:
                 break
-    
-    async def _extract_links_from_page(self):
-        """Extract product links using heuristics"""
-        content = await self.page.content()
-        soup = BeautifulSoup(content, 'html.parser')
-        
-        # Common product link patterns
+
+    def _extract_links_from_page_soup(self, soup: BeautifulSoup, base_url: str):
+        """Extract product links using heuristics from static HTML soup."""
         patterns = [
-            r'/product[s]?/',
-            r'/item[s]?/',
-            r'/p\d+',
-            r'product[-_]id=',
-            r'sku=',
+            r"/product[s]?/",
+            r"/item[s]?/",
+            r"/p\d+",
+            r"product[-_]id=",
+            r"sku=",
         ]
-        
-        for a in soup.find_all('a', href=True):
-            href = a['href']
-            # Skip pagination, category, etc
-            if any(skip in href.lower() for skip in ['page', 'sort', 'filter', 'category']):
+
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+
+            # Skip obvious non-product links
+            if any(skip in href.lower() for skip in ["page=", "sort=", "filter=", "category="]):
                 continue
-            # Check if matches product pattern
+
             if any(re.search(p, href, re.I) for p in patterns):
-                full_url = urljoin(self.page.url, href)
-                if full_url not in self.visited_urls:
+                full_url = urljoin(base_url, href)
+                if full_url not in self.product_urls:
                     self.product_urls.add(full_url)
-                    self.visited_urls.add(full_url)
-    
+
     async def _extract_product(self, product_url: str) -> Dict:
-        """SOW 2.3.B - Extract product data from page"""
+        """SOW 2.3.B - Extract product data from static product page."""
         try:
-            await self.page.goto(product_url)
-            content = await self.page.content()
-            soup = BeautifulSoup(content, 'html.parser')
-            
+            resp = requests.get(product_url, timeout=20)
+            resp.raise_for_status()
+            html = resp.text
+            soup = BeautifulSoup(html, "html.parser")
+
             product = {
-                'source_url': product_url,
-                'title': None,
-                'description': None,
-                'price': None,
-                'currency': None,
-                'availability': None,
-                'category': None,
-                'images': [],
-                'sku': None,
-                'variants': None,
+                "source_url": product_url,
+                "title": None,
+                "description": None,
+                "price": None,
+                "currency": None,
+                "availability": None,
+                "category": None,
+                "images": [],
+                "sku": None,
+                "variants": None,
             }
-            
-            # METHOD 1: Try to parse JSON-LD structured data
+
+            # METHOD 1: JSON-LD
             product_data = self._extract_json_ld(soup)
             if product_data:
                 product.update(product_data)
                 return product
-            
-            # METHOD 2: Try common embedded JSON patterns
-            product_data = self._extract_embedded_json(soup, content)
+
+            # METHOD 2: Embedded JSON (window state, NEXT_DATA, etc.)
+            product_data = self._extract_embedded_json(soup, html)
             if product_data:
                 product.update(product_data)
                 return product
-            
-            # METHOD 3: DOM fallback heuristics
+
+            # METHOD 3: DOM heuristics
             product_data = self._extract_dom_heuristics(soup)
             if product_data:
                 product.update(product_data)
                 return product
-            
+
             return None
         except Exception as e:
             print(f"Error extracting {product_url}: {e}")
             return None
-    
+
     def _extract_json_ld(self, soup: BeautifulSoup) -> Dict:
-        """Extract from schema.org JSON-LD"""
-        for script in soup.find_all('script', {'type': 'application/ld+json'}):
+        """Extract from schema.org JSON-LD."""
+        for script in soup.find_all("script", {"type": "application/ld+json"}):
             try:
+                if not script.string:
+                    continue
                 data = json.loads(script.string)
-                if data.get('@type') == 'Product':
-                    return {
-                        'title': data.get('name'),
-                        'description': data.get('description'),
-                        'price': float(data.get('offers', {}).get('price', 0)) if data.get('offers') else None,
-                        'currency': data.get('offers', {}).get('priceCurrency'),
-                        'images': [img.get('url') for img in data.get('image', [])] if data.get('image') else [],
-                        'sku': data.get('sku'),
-                        'availability': data.get('offers', {}).get('availability'),
-                    }
-            except:
+
+                # Some sites wrap JSON-LD in a list
+                if isinstance(data, list):
+                    for item in data:
+                        result = self._extract_product_from_jsonld_item(item)
+                        if result:
+                            return result
+                else:
+                    result = self._extract_product_from_jsonld_item(data)
+                    if result:
+                        return result
+            except Exception:
                 continue
         return None
-    
+
+    def _extract_product_from_jsonld_item(self, data: Dict) -> Dict:
+        if not isinstance(data, dict):
+            return None
+        if data.get("@type") not in {"Product", "product"}:
+            return None
+
+        images = []
+        img_field = data.get("image")
+        if isinstance(img_field, list):
+            for img in img_field:
+                if isinstance(img, dict) and img.get("url"):
+                    images.append(img["url"])
+                elif isinstance(img, str):
+                    images.append(img)
+        elif isinstance(img_field, str):
+            images.append(img_field)
+
+        offers = data.get("offers") or {}
+        if isinstance(offers, list):
+            offers = offers[0] if offers else {}
+
+        price_raw = offers.get("price")
+        try:
+            price_val = float(price_raw) if price_raw is not None else None
+        except Exception:
+            price_val = None
+
+        return {
+            "title": data.get("name"),
+            "description": data.get("description"),
+            "price": price_val,
+            "currency": offers.get("priceCurrency"),
+            "images": images,
+            "sku": data.get("sku"),
+            "availability": offers.get("availability"),
+        }
+
     def _extract_embedded_json(self, soup: BeautifulSoup, html_text: str) -> Dict:
-        """Extract from common embedded JSON (window.STATE, NEXT_DATA, etc)"""
+        """Extract from common embedded JSON (window.STATE, NEXT_DATA, etc.)."""
         patterns = [
-            r'window\.__INITIAL_STATE__\s*=\s*({.*?});',
-            r'__NEXT_DATA__\s*=\s*({.*?});',
-            r'window\.STATE\s*=\s*({.*?});',
-            r'Shopify\.theme\s*=\s*({.*?});',
+            r"window\.__INITIAL_STATE__\s*=\s*({.*?});",
+            r"__NEXT_DATA__\s*=\s*({.*?});",
+            r"window\.STATE\s*=\s*({.*?});",
+            r"Shopify\.theme\s*=\s*({.*?});",
         ]
-        
+
         for pattern in patterns:
             match = re.search(pattern, html_text, re.DOTALL)
             if match:
                 try:
                     data = json.loads(match.group(1))
-                    # Try to find product data in parsed JSON
                     return self._extract_from_nested_json(data)
-                except:
+                except Exception:
                     continue
         return None
-    
+
     def _extract_from_nested_json(self, obj) -> Dict:
-        """Recursively search for product info in nested JSON"""
+        """Recursively search for product info in nested JSON."""
         if isinstance(obj, dict):
-            # Look for product fields
             result = {
-                'title': obj.get('title') or obj.get('name') or obj.get('product_name'),
-                'price': obj.get('price') or obj.get('amount'),
-                'description': obj.get('description') or obj.get('desc'),
-                'images': obj.get('images') or obj.get('image_urls') or [],
+                "title": obj.get("title") or obj.get("name") or obj.get("product_name"),
+                "price": obj.get("price") or obj.get("amount"),
+                "description": obj.get("description") or obj.get("desc"),
+                "images": obj.get("images") or obj.get("image_urls") or [],
             }
-            if result['title']:
+            if result["title"]:
+                # Coerce price to float if possible
+                price = result["price"]
+                try:
+                    result["price"] = float(price) if price is not None else None
+                except Exception:
+                    pass
                 return result
-            # Recurse into nested objects
+
             for v in obj.values():
                 if isinstance(v, (dict, list)):
                     data = self._extract_from_nested_json(v)
-                    if data and data.get('title'):
+                    if data and data.get("title"):
                         return data
+
         elif isinstance(obj, list):
             for item in obj:
                 data = self._extract_from_nested_json(item)
-                if data and data.get('title'):
+                if data and data.get("title"):
                     return data
+
         return None
-    
+
     def _extract_dom_heuristics(self, soup: BeautifulSoup) -> Dict:
-        """Fallback: extract using DOM heuristics"""
-        product = {}
-        
+        """Fallback: extract using DOM heuristics from static HTML."""
+        product: Dict = {}
+
         # Title: usually h1 or meta og:title
-        title_tag = soup.find('h1') or soup.find('meta', {'property': 'og:title'})
-        product['title'] = title_tag.get_text() if title_tag and title_tag.name != 'meta' else (title_tag.get('content') if title_tag else None)
-        
+        title_tag = soup.find("h1") or soup.find("meta", {"property": "og:title"})
+        if title_tag:
+            if title_tag.name == "meta":
+                product["title"] = title_tag.get("content")
+            else:
+                product["title"] = title_tag.get_text(strip=True)
+
         # Price: look for common price selectors
-        price_tags = soup.find_all(class_=re.compile(r'price', re.I))
+        price_tags = soup.find_all(class_=re.compile(r"price", re.I))
         if price_tags:
             price_text = price_tags[0].get_text()
-            price_match = re.search(r'[\$£€₹]?\s*(\d+\.?\d*)', price_text)
+            price_match = re.search(r"[\$£€₹]?\s*(\d+\.?\d*)", price_text)
             if price_match:
-                product['price'] = float(price_match.group(1))
-        
+                try:
+                    product["price"] = float(price_match.group(1))
+                except Exception:
+                    pass
+
         # Description
-        desc_tag = soup.find(class_=re.compile(r'description|desc|product-info', re.I))
-        product['description'] = desc_tag.get_text()[:500] if desc_tag else None
-        
+        desc_tag = soup.find(class_=re.compile(r"description|desc|product-info", re.I))
+        if desc_tag:
+            product["description"] = desc_tag.get_text(strip=True)[:500]
+
         # Images
         images = []
-        for img in soup.find_all('img')[:6]:
-            src = img.get('src') or img.get('data-src')
-            if src and src.startswith('http'):
+        for img in soup.find_all("img")[:6]:
+            src = img.get("src") or img.get("data-src")
+            if src and src.startswith("http"):
                 images.append(src)
-        product['images'] = images
-        
-        return product if product.get('title') else None
+        product["images"] = images
 
+        return product if product.get("title") else None
