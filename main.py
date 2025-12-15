@@ -42,6 +42,11 @@ Base.metadata.create_all(bind=engine)
 # FastAPI app
 app = FastAPI(title="Ecommerce Crawler API", version="1.0.0")
 
+@app.get("/debug-routes")
+async def debug_routes():
+    return [r.path for r in app.routes]
+
+
 # CORS for frontend
 app.add_middleware(
     CORSMiddleware,
