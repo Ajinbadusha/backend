@@ -6,6 +6,8 @@ import os
 import uuid
 from datetime import datetime
 from typing import Dict, Optional, List
+from urllib.parse import urlparse, urlunparse
+import math
 
 import asyncio
 from fastapi import (
@@ -19,6 +21,7 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 
 from database import (
     Base,
@@ -78,12 +81,22 @@ class JobResponse(BaseModel):
     counters: Dict
 
 
+class JobListItem(BaseModel):
+    id: str
+    input_url: str
+    status: str
+    created_at: datetime
+    finished_at: Optional[datetime]
+    counters: Dict
+
 class ProductResponse(BaseModel):
     id: str
     title: str
     price: Optional[float]
     images: List[str]
     source_url: str
+    description: Optional[str] = None
+    match_reason: Optional[str] = None
 
 
 @app.websocket("/ws")
@@ -156,16 +169,46 @@ async def create_job(
 ):
     """
     SOW 2.2.A - POST /jobs
-    Create new crawl job
+    Create new crawl job with basic validation and duplicate detection.
     """
+    # ---- URL validation & normalization ----
+    parsed = urlparse(job_request.url.strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise HTTPException(status_code=400, detail="Invalid URL. Use http(s)://domain/path")
+
+    # Normalize domain (strip www.) and rebuild URL
+    netloc = parsed.netloc.lower()
+    if netloc.startswith("www."):
+        netloc = netloc[4:]
+    normalized_url = urlunparse(parsed._replace(netloc=netloc))
+
+    # Update request URL to normalized form
+    job_request.url = normalized_url
+    options = job_request.options or {}
+
+    # ---- Prevent duplicate identical jobs unless force_rerun ----
+    force_rerun = bool(options.get("force_rerun", False))
+    existing = (
+        db.query(Job)
+        .filter(Job.input_url == normalized_url)
+        .order_by(Job.created_at.desc())
+        .first()
+    )
+    if existing and not force_rerun:
+        return {
+            "job_id": existing.id,
+            "status": existing.status,
+            "counters": existing.counters or {},
+        }
+
     job_id = str(uuid.uuid4())
 
     job = Job(
         id=job_id,
-        input_url=job_request.url,
-        domain=job_request.url.split("/")[2],
+        input_url=normalized_url,
+        domain=netloc,
         status="queued",
-        options=job_request.options,
+        options=options,
         counters={
             "pages_visited": 0,
             "products_discovered": 0,
@@ -188,6 +231,25 @@ async def create_job(
         "status": job.status,
         "counters": job.counters,
     }
+
+
+@app.get("/jobs", response_model=List[JobListItem])
+async def list_jobs(db: Session = Depends(get_db)):
+    """
+    Admin: list recent jobs with basic stats.
+    """
+    jobs = db.query(Job).order_by(Job.created_at.desc()).limit(50).all()
+    return [
+        JobListItem(
+            id=j.id,
+            input_url=j.input_url,
+            status=j.status,
+            created_at=j.created_at,
+            finished_at=j.finished_at,
+            counters=j.counters or {},
+        )
+        for j in jobs
+    ]
 
 
 @app.get("/jobs/{job_id}")
@@ -233,46 +295,126 @@ async def cancel_job(job_id: str, db: Session = Depends(get_db)):
 
 
 @app.get("/search", response_model=List[ProductResponse])
-async def search(job_id: str, q: str, limit: int = 10, db: Session = Depends(get_db)):
+async def search(
+    job_id: str,
+    q: str,
+    limit: int = 10,
+    category: Optional[str] = None,
+    min_price: Optional[float] = None,
+    max_price: Optional[float] = None,
+    availability: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
     """
-    SOW 2.2.A - GET /search
-    Semantic search with simple text scoring (demo).
+    SOW 2.2.A & 2.6 - GET /search
+    Semantic search using vector embeddings with filter support.
+    Falls back to keyword scoring if vectors are unavailable.
     """
-    products = db.query(Product).filter(Product.job_id == job_id).all()
+    base_query = db.query(Product).filter(Product.job_id == job_id)
 
-    scored: List[tuple[int, Product]] = []
-    query_words = q.lower().split()
+    if category:
+        base_query = base_query.filter(Product.category.ilike(f"%{category}%"))
+    if min_price is not None:
+        base_query = base_query.filter(Product.price >= min_price)
+    if max_price is not None:
+        base_query = base_query.filter(Product.price <= max_price)
+    if availability:
+        base_query = base_query.filter(Product.availability.ilike(f"%{availability}%"))
 
-    for prod in products:
-        enrichment = (
-            db.query(ProductEnrichment)
-            .filter(ProductEnrichment.product_id == prod.id)
-            .first()
+    products = base_query.all()
+    if not products:
+        return []
+
+    product_ids = [p.id for p in products]
+
+    # Try vector-based semantic search first
+    vectors = (
+        db.query(ProductVector)
+        .filter(ProductVector.product_id.in_(product_ids))
+        .all()
+    )
+    vector_map = {v.product_id: v.embedding for v in vectors if v.embedding}
+
+    scored: List[tuple[float, Product, Optional[str]]] = []
+
+    if vector_map:
+        enricher = AIEnrichment()
+        query_vec = await enricher.embed_text(q)
+
+        def cosine(a: List[float], b: List[float]) -> float:
+            if not a or not b:
+                return 0.0
+            dot = sum(x * y for x, y in zip(a, b))
+            na = math.sqrt(sum(x * x for x in a))
+            nb = math.sqrt(sum(x * x for x in b))
+            if na == 0 or nb == 0:
+                return 0.0
+            return dot / (na * nb)
+
+        for prod in products:
+            vec = vector_map.get(prod.id)
+            if not vec:
+                continue
+            sim = cosine(query_vec, vec)
+            if sim <= 0:
+                continue
+
+            enrichment = (
+                db.query(ProductEnrichment)
+                .filter(ProductEnrichment.product_id == prod.id)
+                .first()
+            )
+            reason = (enrichment.visual_summary if enrichment else "") or (
+                prod.description or ""
+            )
+            reason = (reason or "")[:200]
+            scored.append((sim, prod, reason))
+
+        scored.sort(reverse=True, key=lambda x: x[0])
+
+    # Fallback: simple keyword overlap if no vectors / scores
+    if not scored:
+        query_words = q.lower().split()
+        for prod in products:
+            enrichment = (
+                db.query(ProductEnrichment)
+                .filter(ProductEnrichment.product_id == prod.id)
+                .first()
+            )
+            enrichment_text = enrichment.enriched_text if enrichment else ""
+            search_text = (
+                (prod.title or "")
+                + " "
+                + (prod.description or "")
+                + " "
+                + enrichment_text
+            ).lower()
+
+            score = sum(1 for word in query_words if word in search_text)
+            if score > 0:
+                reason = (enrichment.visual_summary if enrichment else "") or (
+                    prod.description or ""
+                )
+                reason = (reason or "")[:200]
+                scored.append((float(score), prod, reason))
+
+        scored.sort(reverse=True, key=lambda x: x[0])
+
+    results: List[ProductResponse] = []
+    for score, prod, reason in scored[:limit]:
+        results.append(
+            ProductResponse(
+                id=prod.id,
+                title=prod.title or "Unknown",
+                price=prod.price,
+                images=[img.storage_url for img in prod.images],
+                source_url=prod.source_url,
+                description=prod.description,
+                match_reason=reason,
+            )
         )
-        search_text = (
-            (prod.title or "")
-            + " "
-            + (prod.description or "")
-            + " "
-            + (enrichment.enriched_text if enrichment else "")
-        ).lower()
 
-        score = sum(1 for word in query_words if word in search_text)
-        if score > 0:
-            scored.append((score, prod))
-
-    scored.sort(reverse=True, key=lambda x: x[0])
-
-    return [
-        ProductResponse(
-            id=prod.id,
-            title=prod.title or "Unknown",
-            price=prod.price,
-            images=[img.storage_url for img in prod.images],
-            source_url=prod.source_url,
-        )
-        for _, prod in scored[:limit]
-    ]
+    return results
 
 
 @app.get("/products/{product_id}")
@@ -331,6 +473,8 @@ async def crawl_and_process(job_id: str, url: str, options: Dict):
 
         products_data = await crawler.crawl(url)
 
+        # Update crawl counters (pages + discovered products)
+        job.counters["pages_visited"] = len(crawler.visited_urls)
         job.counters["products_discovered"] = len(products_data)
         db.commit()
         await broadcast_status(job_id, db)
@@ -341,39 +485,63 @@ async def crawl_and_process(job_id: str, url: str, options: Dict):
         db.commit()
         await broadcast_status(job_id, db)
 
-        # PHASE 3: DOWNLOAD IMAGES (demo: just count)
-        if options.get("download_images", True):
+        # PHASE 3: DOWNLOAD IMAGES (demo-grade: we persist ProductImage records)
+        download_images = options.get("download_images", True)
+        if download_images:
             job.status = "downloading"
             db.commit()
             await broadcast_status(job_id, db)
 
-            job.counters["images_downloaded"] = len(products_data) * 3
-            db.commit()
-            await broadcast_status(job_id, db)
-
-        # PHASE 4: ENRICH WITH AI
+        # PHASE 4: ENRICH WITH AI (also creates ProductImage + vectors)
         job.status = "enriching"
         db.commit()
         await broadcast_status(job_id, db)
 
         enricher = AIEnrichment()
 
+        seen_urls = set()
+
         for prod_data in products_data:
             try:
-                product = Product(
-                    id=str(uuid.uuid4()),
-                    job_id=job_id,
-                    source_url=prod_data["source_url"],
-                    title=prod_data.get("title", "Unknown"),
-                    description=prod_data.get("description"),
-                    price=prod_data.get("price"),
-                    currency=prod_data.get("currency"),
-                    availability=prod_data.get("availability"),
-                    category=prod_data.get("category"),
-                    raw_json=prod_data,
+                src_url = prod_data["source_url"]
+                if src_url in seen_urls:
+                    continue
+                seen_urls.add(src_url)
+
+                # Skip duplicate products by source_url (unique constraint)
+                existing_product = (
+                    db.query(Product)
+                    .filter(Product.source_url == src_url)
+                    .first()
                 )
-                db.add(product)
-                db.commit()
+                if existing_product:
+                    product = existing_product
+                else:
+                    product = Product(
+                        id=str(uuid.uuid4()),
+                        job_id=job_id,
+                        source_url=src_url,
+                        title=prod_data.get("title", "Unknown"),
+                        description=prod_data.get("description"),
+                        price=prod_data.get("price"),
+                        currency=prod_data.get("currency"),
+                        availability=prod_data.get("availability"),
+                        category=prod_data.get("category"),
+                        raw_json=prod_data,
+                    )
+                    try:
+                        db.add(product)
+                        db.commit()
+                    except IntegrityError:
+                        db.rollback()
+                        product = (
+                            db.query(Product)
+                            .filter(Product.source_url == src_url)
+                            .first()
+                        )
+                        if not product:
+                            # If still not found, skip this product
+                            continue
 
                 for i, img_url in enumerate(prod_data.get("images", [])[:3]):
                     img_obj = ProductImage(
@@ -397,6 +565,16 @@ async def crawl_and_process(job_id: str, url: str, options: Dict):
                 )
                 db.add(enrichment)
                 db.commit()
+
+                # Create vector embedding for semantic search
+                embedding = await enricher.embed_text(enrichment.enriched_text)
+                if embedding:
+                    vector = ProductVector(
+                        id=str(uuid.uuid4()),
+                        product_id=product.id,
+                        embedding=embedding,
+                    )
+                    db.add(vector)
 
                 job.counters["products_enriched"] += 1
                 db.commit()

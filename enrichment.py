@@ -4,14 +4,11 @@ AI Enrichment Pipeline
 - Text: Normalization + attribute extraction
 """
 
-import openai
 import json
-import base64
-import requests
 from typing import Dict, List
 import os
 
-openai.api_key = os.getenv('OPENAI_API_KEY')
+from openai import OpenAI
 
 
 class AIEnrichment:
@@ -77,11 +74,27 @@ class AIEnrichment:
         
         return enrichment
     
+    async def embed_text(self, text: str) -> List[float]:
+        """Create embedding for semantic search (SOW 2.6)."""
+        if not text:
+            return []
+        try:
+            client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+            response = client.embeddings.create(
+                model="text-embedding-3-small",
+                input=text,
+            )
+            return response.data[0].embedding
+        except Exception as e:
+            print(f"OpenAI embedding error: {e}")
+            return []
+    
     async def _process_image(self, image_url: str) -> Dict:
         """SOW 2.5.A - Vision enrichment"""
         try:
             # Call OpenAI GPT-4 Vision
-            response = openai.chat.completions.create(
+            client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+            response = client.chat.completions.create(
                 model="gpt-4-vision-preview",
                 messages=[
                     {
@@ -128,7 +141,8 @@ class AIEnrichment:
             return {}
         
         try:
-            response = openai.chat.completions.create(
+            client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+            response = client.chat.completions.create(
                 model="gpt-3.5-turbo",
                 messages=[
                     {

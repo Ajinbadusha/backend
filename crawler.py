@@ -24,6 +24,17 @@ class UniversalCrawler:
         self.headless = headless  # kept for compatibility, but unused
         self.visited_urls: Set[str] = set()
         self.product_urls: Set[str] = set()
+        self.session = requests.Session()
+        self.session.headers.update(
+            {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0 Safari/537.36"
+                ),
+                "Accept-Language": "en-US,en;q=0.9",
+            }
+        )
 
     async def start(self):
         """Kept for backwards compatibility (no-op for requests-based crawler)."""
@@ -61,7 +72,7 @@ class UniversalCrawler:
                 break
             self.visited_urls.add(current_url)
 
-            resp = requests.get(current_url, timeout=20)
+            resp = self.session.get(current_url, timeout=20)
             resp.raise_for_status()
             soup = BeautifulSoup(resp.text, "html.parser")
 
@@ -103,7 +114,7 @@ class UniversalCrawler:
     async def _extract_product(self, product_url: str) -> Dict:
         """SOW 2.3.B - Extract product data from static product page."""
         try:
-            resp = requests.get(product_url, timeout=20)
+            resp = self.session.get(product_url, timeout=20)
             resp.raise_for_status()
             html = resp.text
             soup = BeautifulSoup(html, "html.parser")
