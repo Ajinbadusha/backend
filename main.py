@@ -45,15 +45,31 @@ Base.metadata.create_all(bind=engine)
 # FastAPI app
 app = FastAPI(title="Ecommerce Crawler API", version="1.0.0")
 
+# Health check endpoint
+@app.get("/health")
+async def health_check():
+    """Health check endpoint for monitoring"""
+    return {
+        "status": "healthy",
+        "service": "ecommerce-crawler-api",
+        "version": "1.0.0"
+    }
+
 @app.get("/debug-routes")
 async def debug_routes():
-    return [r.path for r in app.routes]
+    """Debug endpoint to list all registered routes"""
+    return [{"path": r.path, "methods": r.methods, "name": r.name} for r in app.routes]
 
 
-# CORS for frontend
+# CORS for frontend - Updated for production
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten later if needed
+    allow_origins=[
+        FRONTEND_URL,
+        "http://localhost:5173",  # Local development
+        "http://localhost:3000",  # Alternative local port
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
