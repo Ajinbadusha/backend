@@ -51,7 +51,7 @@ Base.metadata.create_all(bind=engine)
 # FastAPI app
 app = FastAPI(title="Ecommerce Crawler API", version="1.0.0")
 
-@app.get("/")
+@app.route("/", methods=["GET", "HEAD"])
 async def root():
     return {"message": "Ecommerce Crawler API is running. Access /docs for API documentation."}
 
