@@ -121,25 +121,32 @@ class UniversalCrawler:
 
     def _extract_links_from_page_soup(self, soup: BeautifulSoup, base_url: str):
         """Extract product links using heuristics from static HTML soup."""
-        patterns = [
-            r"/product[s]?/",
-            r"/item[s]?/",
-            r"/p\d+",
-            r"product[-_]id=",
-            r"sku=",
-        ]
-
-        for a in soup.find_all("a", href=True):
+        # SOW 2.3.A Fix: Use a more robust selector for product links on common e-commerce platforms (e.g., Shopify)
+        # Look for links that contain '/products/' in their href.
+        # Also look for common product card selectors like 'grid__item' or 'product-card'
+        
+        product_links = set()
+        
+        # Strategy 1: Find all links that contain '/products/'
+        for a in soup.find_all("a", href=re.compile(r"/products/", re.I)):
             href = a["href"]
-
-            # Skip obvious non-product links
+            # Skip obvious non-product links (e.g., links to collections/pages that contain 'products' in the name)
             if any(skip in href.lower() for skip in ["page=", "sort=", "filter=", "category="]):
                 continue
+            
+            full_url = urljoin(base_url, href)
+            product_links.add(full_url)
 
-            if any(re.search(p, href, re.I) for p in patterns):
-                full_url = urljoin(base_url, href)
-                if full_url not in self.product_urls:
-                    self.product_urls.add(full_url)
+        # Strategy 2: Find links within common product card elements (if Strategy 1 is not enough)
+        # This is often redundant if Strategy 1 works, but kept for robustness.
+        # Common Shopify/e-commerce product card classes: 'grid__item', 'product-card', 'product-item'
+        for card in soup.find_all(class_=re.compile(r"product-card|grid__item|product-item", re.I)):
+            link = card.find("a", href=re.compile(r"/products/", re.I))
+            if link and link.get("href"):
+                full_url = urljoin(base_url, link["href"])
+                product_links.add(full_url)
+
+        self.product_urls.update(product_links)
 
     async def _extract_product(self, product_url: str) -> Dict:
         """SOW 2.3.B - Extract product data from static product page."""

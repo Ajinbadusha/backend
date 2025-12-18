@@ -52,12 +52,50 @@ class AIEnrichment:
                 img_result = await self._process_image(img_url)
                 image_data.append(img_result)
                 enrichment['per_image'][i] = img_result
+                
+                # FIX 1: Merge attributes from vision model into main attributes
+                vision_attrs = img_result.get('attributes', {})
+                for key, value in vision_attrs.items():
+                    # Only update if the vision model provided a non-empty/non-default value
+                    if value and value not in ['unknown', 'Unknown', 'N/A', 'n/a', 'none', 'None', []]:
+                        # Standardize 'materials' to 'material'
+                        if key == 'materials':
+                            key = 'material'
+                        
+                        # For lists (like colors), extend the list
+                        if isinstance(value, list) and key == 'colors':
+                            current_colors = set(enrichment['attributes'].get('colors', []))
+                            new_colors = [c for c in value if c not in current_colors]
+                            enrichment['attributes']['colors'].extend(new_colors)
+                        # For single values, update if current is default or new value is better
+                        elif enrichment['attributes'].get(key) in ['unknown', 'Unknown', None] or key != 'colors':
+                            enrichment['attributes'][key] = value
+                            
             except Exception as e:
                 print(f"Error processing image {img_url}: {e}")
         
         # Process text
         text_result = await self._process_text(product.get('description', ''))
-        enrichment['attributes'].update(text_result)
+        
+        # Merge text attributes (text model is good for things like size/care)
+        for key, value in text_result.items():
+            if value and value not in ['unknown', 'Unknown', 'N/A', 'n/a', 'none', 'None', []]:
+                # Standardize 'materials' to 'material'
+                if key == 'materials':
+                    key = 'material'
+                
+                # For lists (like colors), extend the list
+                if isinstance(value, list) and key == 'colors':
+                    current_colors = set(enrichment['attributes'].get('colors', []))
+                    new_colors = [c for c in value if c not in current_colors]
+                    enrichment['attributes']['colors'].extend(new_colors)
+                # For single values, update if current is default or new value is better
+                elif enrichment['attributes'].get(key) in ['unknown', 'Unknown', None] or key != 'colors':
+                    enrichment['attributes'][key] = value
+                    
+        # Clean up colors list to be unique
+        if 'colors' in enrichment['attributes']:
+            enrichment['attributes']['colors'] = list(set(enrichment['attributes']['colors']))
         
         # Create visual summary
         if image_data:
@@ -152,8 +190,8 @@ class AIEnrichment:
                         
                         {description}
                         
-                        Return JSON with fields: category, materials, colors, size_range, care_instructions
-                        Keep unknown fields as null.
+                        Return JSON with fields: category, material, colors, pattern, size_range, care_instructions
+                        Keep unknown fields as null or "unknown".
                         """
                     }
                 ],
