@@ -426,6 +426,7 @@ async def search(
 
     products = base_query.all()
     if not products:
+        # No products stored for this job with the current filters
         return []
 
     product_ids = [p.id for p in products]
@@ -485,7 +486,7 @@ async def search(
 
     # Fallback: simple keyword overlap if no vectors / scores
     if not scored:
-        query_words = q.lower().split()
+        query_words = [w for w in q.lower().split() if w.strip()]
         for prod in products:
             enrichment = (
                 db.query(ProductEnrichment)
@@ -501,13 +502,37 @@ async def search(
                 + enrichment_text
             ).lower()
 
-            score = sum(1 for word in query_words if word in search_text)
-            if score > 0:
+            # If the user supplied a query, prefer products that at least share some words
+            if query_words:
+                score = sum(1 for word in query_words if word in search_text)
+                if score > 0:
+                    reason = (enrichment.visual_summary if enrichment else "") or (
+                        prod.description or ""
+                    )
+                    reason = (reason or "")[:200]
+                    scored.append((float(score), prod, reason))
+            else:
+                # If query is effectively empty, fall back to a neutral score so we still return products
                 reason = (enrichment.visual_summary if enrichment else "") or (
                     prod.description or ""
                 )
                 reason = (reason or "")[:200]
-                scored.append((float(score), prod, reason))
+                scored.append((1.0, prod, reason))
+
+        # If we still have no scored products (e.g. query words not present anywhere),
+        # return all filtered products with a neutral score so the UI never shows an empty grid.
+        if not scored:
+            for prod in products:
+                enrichment = (
+                    db.query(ProductEnrichment)
+                    .filter(ProductEnrichment.product_id == prod.id)
+                    .first()
+                )
+                reason = (enrichment.visual_summary if enrichment else "") or (
+                    prod.description or ""
+                )
+                reason = (reason or "")[:200]
+                scored.append((1.0, prod, reason))
 
         scored.sort(reverse=True, key=lambda x: x[0])
 
