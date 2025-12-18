@@ -63,30 +63,60 @@ class UniversalCrawler:
 
     async def _discover_products(self, listing_url: str):
         """
-        SOW 2.3.A - Find product URLs using hybrid strategy, via static HTML only.
+        SOW 2.3.A - Find product URLs using hybrid strategy with improved pagination.
         """
         current_url = listing_url
+        page_num = 1
 
-        for _ in range(min(3, self.max_pages)):
+        for _ in range(min(self.max_pages, 10)):
             if current_url in self.visited_urls:
                 break
             self.visited_urls.add(current_url)
 
-            resp = self.session.get(current_url, timeout=20)
-            resp.raise_for_status()
-            soup = BeautifulSoup(resp.text, "html.parser")
+            try:
+                resp = self.session.get(current_url, timeout=20)
+                resp.raise_for_status()
+                soup = BeautifulSoup(resp.text, "html.parser")
 
-            self._extract_links_from_page_soup(soup, current_url)
+                self._extract_links_from_page_soup(soup, current_url)
 
-            # Try to find "next" link for pagination
-            next_link = (
-                soup.select_one('a[rel="next"]')
-                or soup.find("a", string=re.compile(r"next", re.I))
-                or soup.find("button", string=re.compile(r"next", re.I))
-            )
-            if next_link and next_link.get("href"):
-                current_url = urljoin(current_url, next_link["href"])
-            else:
+                # Try multiple pagination strategies
+                next_url = None
+
+                # Strategy 1: rel="next" link
+                next_link = soup.select_one('a[rel="next"]')
+                if next_link and next_link.get("href"):
+                    next_url = urljoin(current_url, next_link["href"])
+
+                # Strategy 2: "Next" button/link text
+                if not next_url:
+                    next_link = soup.find("a", string=re.compile(r"next|→|›", re.I))
+                    if next_link and next_link.get("href"):
+                        next_url = urljoin(current_url, next_link["href"])
+
+                # Strategy 3: Common pagination URL patterns
+                if not next_url:
+                    page_num += 1
+                    # Try ?page=N
+                    if "?" in listing_url:
+                        next_url = re.sub(r"page=\d+", f"page={page_num}", listing_url)
+                        if next_url == listing_url:
+                            next_url = f"{listing_url}&page={page_num}"
+                    else:
+                        next_url = f"{listing_url}?page={page_num}"
+
+                    # Try /page/N pattern
+                    if "/page/" not in next_url:
+                        base = listing_url.rstrip("/")
+                        next_url = f"{base}/page/{page_num}"
+
+                if next_url and next_url not in self.visited_urls:
+                    current_url = next_url
+                else:
+                    break
+
+            except Exception as e:
+                print(f"Error discovering products from {current_url}: {e}")
                 break
 
     def _extract_links_from_page_soup(self, soup: BeautifulSoup, base_url: str):

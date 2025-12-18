@@ -130,6 +130,19 @@ class ProductVector(Base):
     product = relationship("Product", back_populates="vector")
 
 
+# TABLE 7: Job Logs - basic log entries per job
+class JobLog(Base):
+    __tablename__ = "job_logs"
+
+    id = Column(String, primary_key=True)
+    job_id = Column(String, ForeignKey("jobs.id"))
+    timestamp = Column(DateTime, default=datetime.utcnow)
+    level = Column(String)  # INFO, WARNING, ERROR
+    message = Column(String)
+
+    job = relationship("Job")
+
+
 def init_db():
     """Create all tables."""
     Base.metadata.create_all(bind=engine)

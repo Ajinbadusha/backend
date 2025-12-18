@@ -8,8 +8,12 @@ from datetime import datetime
 from typing import Dict, Optional, List
 from urllib.parse import urlparse, urlunparse
 import math
+import hashlib
+import ipaddress
+from io import BytesIO
 
 import asyncio
+import aiohttp
 from fastapi import (
     FastAPI,
     WebSocket,
@@ -22,6 +26,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
+from PIL import Image
 
 from database import (
     Base,
@@ -34,6 +39,7 @@ from database import (
     ProductVector,
     Page,
     SessionLocal,
+    JobLog,
 )
 from crawler import UniversalCrawler
 from enrichment import AIEnrichment
@@ -105,6 +111,7 @@ class JobListItem(BaseModel):
     finished_at: Optional[datetime]
     counters: Dict
 
+
 class ProductResponse(BaseModel):
     id: str
     title: str
@@ -113,6 +120,49 @@ class ProductResponse(BaseModel):
     source_url: str
     description: Optional[str] = None
     match_reason: Optional[str] = None
+
+
+def log_job_event(db: Session, job_id: str, level: str, message: str):
+    """Add a log entry for a job."""
+    log_entry = JobLog(
+        id=str(uuid.uuid4()),
+        job_id=job_id,
+        level=level,
+        message=message,
+    )
+    db.add(log_entry)
+    db.commit()
+
+
+def is_safe_url(url: str) -> bool:
+    """
+    Validate URL to prevent SSRF attacks.
+    Blocks localhost, private IPs, and link-local addresses.
+    """
+    try:
+        parsed = urlparse(url)
+        hostname = parsed.hostname
+
+        if not hostname:
+            return False
+
+        # Block localhost-style hosts
+        if hostname in {"localhost", "127.0.0.1", "0.0.0.0", "::1"}:
+            return False
+
+        # Try to interpret hostname directly as IP
+        try:
+            ip = ipaddress.ip_address(hostname)
+            if ip.is_private or ip.is_loopback or ip.is_link_local:
+                return False
+        except ValueError:
+            # Not a literal IP, check common private ranges in hostnames
+            if hostname.startswith("192.168.") or hostname.startswith("10.") or hostname.startswith("172."):
+                return False
+
+        return True
+    except Exception:
+        return False
 
 
 @app.websocket("/ws")
@@ -190,7 +240,17 @@ async def create_job(
     # ---- URL validation & normalization ----
     parsed = urlparse(job_request.url.strip())
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise HTTPException(status_code=400, detail="Invalid URL. Use http(s)://domain/path")
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid URL. Use http(s)://domain/path",
+        )
+
+    # Add SSRF protection
+    if not is_safe_url(job_request.url):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid URL: Cannot crawl internal/private network addresses",
+        )
 
     # Normalize domain (strip www.) and rebuild URL
     netloc = parsed.netloc.lower()
@@ -289,12 +349,29 @@ async def get_job(job_id: str, db: Session = Depends(get_db)):
 
 
 @app.get("/jobs/{job_id}/logs")
-async def get_logs(job_id: str, db: Session = Depends(get_db)):
+async def get_logs(job_id: str, limit: int = 100, db: Session = Depends(get_db)):
     """
     SOW 2.2.A - GET /jobs/{jobId}/logs
-    Placeholder for log streaming.
+    Return recent log entries for a job.
     """
-    return {"logs": []}
+    logs = (
+        db.query(JobLog)
+        .filter(JobLog.job_id == job_id)
+        .order_by(JobLog.timestamp.desc())
+        .limit(limit)
+        .all()
+    )
+    # Return logs in chronological order
+    return {
+        "logs": [
+            {
+                "timestamp": log.timestamp.isoformat() if log.timestamp else None,
+                "level": log.level,
+                "message": log.message,
+            }
+            for log in reversed(logs)
+        ]
+    }
 
 
 @app.post("/jobs/{job_id}/cancel")
@@ -354,39 +431,47 @@ async def search(
     scored: List[tuple[float, Product, Optional[str]]] = []
 
     if vector_map:
-        enricher = AIEnrichment()
-        query_vec = await enricher.embed_text(q)
+        try:
+            enricher = AIEnrichment()
+            query_vec = await enricher.embed_text(q)
 
-        def cosine(a: List[float], b: List[float]) -> float:
-            if not a or not b:
-                return 0.0
-            dot = sum(x * y for x, y in zip(a, b))
-            na = math.sqrt(sum(x * x for x in a))
-            nb = math.sqrt(sum(x * x for x in b))
-            if na == 0 or nb == 0:
-                return 0.0
-            return dot / (na * nb)
+            if not query_vec:
+                # Embedding failed, fall back to keyword search
+                print(f"Warning: Embedding generation failed for query: {q}")
+            else:
+                def cosine(a: List[float], b: List[float]) -> float:
+                    if not a or not b:
+                        return 0.0
+                    dot = sum(x * y for x, y in zip(a, b))
+                    na = math.sqrt(sum(x * x for x in a))
+                    nb = math.sqrt(sum(x * x for x in b))
+                    if na == 0 or nb == 0:
+                        return 0.0
+                    return dot / (na * nb)
 
-        for prod in products:
-            vec = vector_map.get(prod.id)
-            if not vec:
-                continue
-            sim = cosine(query_vec, vec)
-            if sim <= 0:
-                continue
+                for prod in products:
+                    vec = vector_map.get(prod.id)
+                    if not vec:
+                        continue
+                    sim = cosine(query_vec, vec)
+                    if sim <= 0:
+                        continue
 
-            enrichment = (
-                db.query(ProductEnrichment)
-                .filter(ProductEnrichment.product_id == prod.id)
-                .first()
-            )
-            reason = (enrichment.visual_summary if enrichment else "") or (
-                prod.description or ""
-            )
-            reason = (reason or "")[:200]
-            scored.append((sim, prod, reason))
+                    enrichment = (
+                        db.query(ProductEnrichment)
+                        .filter(ProductEnrichment.product_id == prod.id)
+                        .first()
+                    )
+                    reason = (enrichment.visual_summary if enrichment else "") or (
+                        prod.description or ""
+                    )
+                    reason = (reason or "")[:200]
+                    scored.append((sim, prod, reason))
 
-        scored.sort(reverse=True, key=lambda x: x[0])
+                scored.sort(reverse=True, key=lambda x: x[0])
+        except Exception as e:
+            print(f"Error in vector search: {e}. Falling back to keyword search.")
+            # scored will remain empty, triggering keyword fallback below
 
     # Fallback: simple keyword overlap if no vectors / scores
     if not scored:
@@ -465,6 +550,44 @@ async def get_product(product_id: str, db: Session = Depends(get_db)):
     }
 
 
+async def download_and_store_image(
+    session: aiohttp.ClientSession, img_url: str, product_id: str
+) -> Dict:
+    """
+    Downloads an image, calculates its hash, extracts dimensions, and returns metadata.
+    In production, upload to S3. For demo, we reuse the original URL.
+    """
+    try:
+        async with session.get(
+            img_url, timeout=aiohttp.ClientTimeout(total=15)
+        ) as response:
+            if response.status != 200:
+                return None
+
+            image_bytes = await response.read()
+            img_hash = hashlib.md5(image_bytes).hexdigest()
+
+            # Extract image dimensions
+            try:
+                img = Image.open(BytesIO(image_bytes))
+                width, height = img.size
+            except Exception:
+                width, height = None, None
+
+            storage_url = img_url  # TODO: replace with S3 URL in production
+
+            return {
+                "storage_url": storage_url,
+                "hash": img_hash,
+                "source_url": img_url,
+                "width": width,
+                "height": height,
+            }
+    except Exception as e:
+        print(f"Error downloading image {img_url}: {e}")
+        return None
+
+
 async def crawl_and_process(job_id: str, url: str, options: Dict):
     """
     Main background task - crawl, extract, enrich, index.
@@ -475,6 +598,8 @@ async def crawl_and_process(job_id: str, url: str, options: Dict):
         job = db.query(Job).filter(Job.id == job_id).first()
         if not job:
             return
+
+        log_job_event(db, job_id, "INFO", f"Starting crawl for {url}")
 
         # PHASE 1: CRAWL
         job.status = "crawling"
@@ -495,6 +620,13 @@ async def crawl_and_process(job_id: str, url: str, options: Dict):
         db.commit()
         await broadcast_status(job_id, db)
 
+        log_job_event(
+            db,
+            job_id,
+            "INFO",
+            f"Discovered {len(products_data)} products from crawl",
+        )
+
         # PHASE 2: PARSE & EXTRACT
         job.status = "parsing"
         job.counters["products_extracted"] = len(products_data)
@@ -512,6 +644,7 @@ async def crawl_and_process(job_id: str, url: str, options: Dict):
         job.status = "enriching"
         db.commit()
         await broadcast_status(job_id, db)
+        log_job_event(db, job_id, "INFO", "Starting AI enrichment phase")
 
         enricher = AIEnrichment()
 
@@ -524,15 +657,14 @@ async def crawl_and_process(job_id: str, url: str, options: Dict):
                     continue
                 seen_urls.add(src_url)
 
-                # Skip duplicate products by source_url (unique constraint)
-                existing_product = (
+                # Try to get existing product or create a new one
+                product = (
                     db.query(Product)
                     .filter(Product.source_url == src_url)
                     .first()
                 )
-                if existing_product:
-                    product = existing_product
-                else:
+
+                if not product:
                     product = Product(
                         id=str(uuid.uuid4()),
                         job_id=job_id,
@@ -545,30 +677,39 @@ async def crawl_and_process(job_id: str, url: str, options: Dict):
                         category=prod_data.get("category"),
                         raw_json=prod_data,
                     )
+                    db.add(product)
                     try:
-                        db.add(product)
                         db.commit()
                     except IntegrityError:
                         db.rollback()
+                        # Another worker created it concurrently; fetch again
                         product = (
                             db.query(Product)
                             .filter(Product.source_url == src_url)
                             .first()
                         )
                         if not product:
-                            # If still not found, skip this product
-                            continue
+                            continue  # Skip if still not found
 
-                for i, img_url in enumerate(prod_data.get("images", [])[:3]):
-                    img_obj = ProductImage(
-                        id=str(uuid.uuid4()),
-                        product_id=product.id,
-                        source_url=img_url,
-                        storage_url=img_url,
-                        hash=str(i),
-                    )
-                    db.add(img_obj)
-                db.commit()
+                # Download and store images
+                if download_images:
+                    async with aiohttp.ClientSession() as http_session:
+                        for img_url in prod_data.get("images", [])[:3]:
+                            image_meta = await download_and_store_image(
+                                http_session, img_url, product.id
+                            )
+                            if image_meta:
+                                img_obj = ProductImage(
+                                    id=str(uuid.uuid4()),
+                                    product_id=product.id,
+                                    **image_meta,
+                                )
+                                db.add(img_obj)
+                                job.counters["images_downloaded"] = (
+                                    job.counters.get("images_downloaded", 0) + 1
+                                )
+                        db.commit()
+                        await broadcast_status(job_id, db)
 
                 enrichment_data = await enricher.enrich_product(prod_data)
                 enrichment = ProductEnrichment(
@@ -597,6 +738,12 @@ async def crawl_and_process(job_id: str, url: str, options: Dict):
                 await broadcast_status(job_id, db)
             except Exception as e:
                 print(f"Error enriching product: {e}")
+                log_job_event(
+                    db,
+                    job_id,
+                    "ERROR",
+                    f"Failed to enrich product from {src_url}: {e}",
+                )
                 db.rollback()
 
         # PHASE 5: INDEX (placeholder)
@@ -604,6 +751,12 @@ async def crawl_and_process(job_id: str, url: str, options: Dict):
         job.counters["products_indexed"] = job.counters.get("products_enriched", 0)
         db.commit()
         await broadcast_status(job_id, db)
+        log_job_event(
+            db,
+            job_id,
+            "INFO",
+            f"Indexing completed for {job.counters['products_indexed']} products",
+        )
 
         # COMPLETE
         job.status = "completed"
@@ -618,6 +771,11 @@ async def crawl_and_process(job_id: str, url: str, options: Dict):
         db.commit()
         await broadcast_status(job_id, db)
         print(f"Job {job_id} failed: {e}")
+        # Best-effort logging; ignore failures here
+        try:
+            log_job_event(db, job_id, "ERROR", f"Job failed: {e}")
+        except Exception:
+            pass
     finally:
         db.close()
 
