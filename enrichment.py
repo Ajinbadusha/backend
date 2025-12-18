@@ -96,6 +96,44 @@ class AIEnrichment:
         # Clean up colors list to be unique
         if 'colors' in enrichment['attributes']:
             enrichment['attributes']['colors'] = list(set(enrichment['attributes']['colors']))
+
+        # FINAL FALLBACK: if AI calls failed or returned almost nothing,
+        # derive lightweight attributes from title/description without OpenAI.
+        attrs = enrichment['attributes']
+        if (
+            attrs.get('category') in ['unknown', None]
+            and not attrs.get('colors')
+            and attrs.get('material') in ['unknown', None]
+        ):
+            title = (product.get('title') or '').lower()
+            desc = (product.get('description') or '').lower()
+            text = f"{title} {desc}"
+
+            # Simple color extraction
+            basic_colors = [
+                'black', 'white', 'red', 'blue', 'green',
+                'yellow', 'pink', 'purple', 'silver', 'gold',
+                'brown', 'beige', 'grey', 'gray', 'orange',
+            ]
+            found_colors = sorted({c for c in basic_colors if c in text})
+            if found_colors:
+                attrs['colors'] = found_colors
+
+            # Simple material extraction
+            materials = ['gold', 'silver', 'diamond', 'leather', 'cotton', 'metal', 'steel', 'wood']
+            for mat in materials:
+                if mat in text:
+                    attrs['material'] = mat
+                    break
+
+            # Category heuristic from existing product metadata or keywords
+            if attrs.get('category') in ['unknown', None]:
+                if product.get('category'):
+                    attrs['category'] = product['category']
+                elif any(k in text for k in ['ring', 'necklace', 'earring', 'bracelet']):
+                    attrs['category'] = 'jewellery'
+                elif any(k in text for k in ['shirt', 'dress', 'jeans', 't-shirt', 'hoodie']):
+                    attrs['category'] = 'clothing'
         
         # Create visual summary
         if image_data:
