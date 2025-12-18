@@ -57,7 +57,8 @@ async def health_check():
 
 @app.get("/debug-routes")
 async def debug_routes():
-    return [r.path for r in app.routes]
+    """Debug endpoint to list all registered routes"""
+    return [{"path": r.path, "methods": r.methods, "name": r.name} for r in app.routes]
 
 
 # CORS for frontend - Updated for production

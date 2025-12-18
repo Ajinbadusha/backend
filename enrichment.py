@@ -92,7 +92,7 @@ class AIEnrichment:
     async def _process_image(self, image_url: str) -> Dict:
         """SOW 2.5.A - Vision enrichment"""
         try:
-            # Call OpenAI GPT-4 Vision
+            # Call OpenAI GPT-4o (updated from deprecated gpt-4-vision-preview)
             client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
             response = client.chat.completions.create(
                 model="gpt-4o-mini",  # Updated to current, cost-efficient model
@@ -169,4 +169,3 @@ class AIEnrichment:
             pass
         
         return {}
-
