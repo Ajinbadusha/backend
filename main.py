@@ -84,6 +84,7 @@ app.add_middleware(
         FRONTEND_URL,
         "http://localhost:5173",  # Local development
         "http://localhost:3000",  # Alternative local port
+        "https://frontend-rymq.onrender.com",  # Production frontend URL from error message
     ],
     allow_credentials=True,
     allow_methods=["*"],
