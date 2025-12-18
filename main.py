@@ -565,7 +565,7 @@ async def download_and_store_image(
 ) -> Dict:
     """
     Downloads an image, calculates its hash, extracts dimensions, and returns metadata.
-    In production, upload to S3. For demo, we reuse the original URL.
+    For this demo, images are saved to a local 'download' folder inside the backend directory.
     """
     try:
         async with session.get(
@@ -584,7 +584,30 @@ async def download_and_store_image(
             except Exception:
                 width, height = None, None
 
-            storage_url = img_url  # TODO: replace with S3 URL in production
+            # Save to local download folder
+            backend_dir = os.path.dirname(__file__)
+            download_dir = os.path.join(backend_dir, "download")
+            os.makedirs(download_dir, exist_ok=True)
+
+            # Try to infer an extension from the URL, default to .jpg
+            ext = ".jpg"
+            for candidate in [".jpg", ".jpeg", ".png", ".webp"]:
+                if img_url.lower().endswith(candidate):
+                    ext = candidate
+                    break
+
+            filename = f"{product_id}_{img_hash}{ext}"
+            file_path = os.path.join(download_dir, filename)
+            try:
+                with open(file_path, "wb") as f:
+                    f.write(image_bytes)
+            except Exception as e:
+                print(f"Error saving image {img_url} to disk: {e}")
+                file_path = None
+
+            # For the frontend we keep the original URL so images are loadable over HTTP.
+            # The local copy is purely for archival / debugging purposes.
+            storage_url = img_url
 
             return {
                 "storage_url": storage_url,
