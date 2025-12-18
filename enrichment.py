@@ -95,7 +95,7 @@ class AIEnrichment:
             # Call OpenAI GPT-4 Vision
             client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
             response = client.chat.completions.create(
-                model="gpt-4-vision-preview",
+                model="gpt-4o-mini",  # Updated to current, cost-efficient model
                 messages=[
                     {
                         "role": "user",

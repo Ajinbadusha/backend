@@ -21,6 +21,10 @@ DATABASE_URL = os.getenv(
     "postgresql://crawler:crawler_demo_pass@localhost:5432/ecommerce_db",
 )
 
+# Fix for Render: postgres:// -> postgresql://
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
