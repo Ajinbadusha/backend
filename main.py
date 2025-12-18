@@ -51,7 +51,9 @@ Base.metadata.create_all(bind=engine)
 # FastAPI app
 app = FastAPI(title="Ecommerce Crawler API", version="1.0.0")
 
-@app.route("/", methods=["GET", "HEAD"])
+# Root endpoint for deployment health check
+@app.get("/")
+@app.head("/") # Explicitly allow HEAD requests for health checks
 async def root():
     return {"message": "Ecommerce Crawler API is running. Access /docs for API documentation."}
 
