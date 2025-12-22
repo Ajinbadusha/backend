@@ -52,7 +52,7 @@ Base.metadata.create_all(bind=engine)
 app = FastAPI(title="Ecommerce Crawler API", version="1.0.0")
 
 # --- Security Dependencies ---
-API_KEY = os.getenv("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 ", "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 ")
+API_KEY = os.getenv("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 ")
 
 def get_api_key(api_key: str = Header(None, alias="X-API-Key")):
     if api_key != API_KEY:
