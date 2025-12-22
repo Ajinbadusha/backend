@@ -1,57 +1,54 @@
 """
-Universal Ecommerce Crawler
-Handles: pagination, product discovery, extraction
-
-This version uses plain HTTP requests + BeautifulSoup only,
-so it works on hosts where Playwright browsers cannot run.
+Universal Ecommerce Crawler (Playwright-based)
+Handles: pagination, product discovery, extraction, and infinite scroll.
 """
 
 import json
 import re
+import asyncio
 from typing import List, Dict, Set
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
-import requests
 from bs4 import BeautifulSoup
-
+from playwright.async_api import async_playwright, Browser, Page, Playwright
 
 class UniversalCrawler:
-    """Crawl any ecommerce site using hybrid extraction strategy"""
+    """Crawl any ecommerce site using hybrid extraction strategy with Playwright."""
 
     def __init__(self, max_pages: int = 10, max_products: int = 50, headless: bool = True):
         self.max_pages = max_pages
         self.max_products = max_products
-        self.headless = headless  # kept for compatibility, but unused
+        self.headless = headless
         self.visited_urls: Set[str] = set()
         self.product_urls: Set[str] = set()
-        self.session = requests.Session()
-        self.session.headers.update(
-            {
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/120.0 Safari/537.36"
-                ),
-                "Accept-Language": "en-US,en;q=0.9",
-            }
-        )
+        self.browser: Browser = None
+        self.playwright: Playwright = None
 
     async def start(self):
-        """Kept for backwards compatibility (no-op for requests-based crawler)."""
-        return
+        """Initialize Playwright and launch the browser."""
+        self.playwright = await async_playwright().start()
+        self.browser = await self.playwright.chromium.launch(headless=self.headless)
 
     async def stop(self):
-        """Kept for backwards compatibility (no-op for requests-based crawler)."""
-        return
+        """Close the browser and stop Playwright."""
+        if self.browser:
+            await self.browser.close()
+        if self.playwright:
+            await self.playwright.stop()
 
     async def crawl(self, start_url: str) -> List[Dict]:
         """Main crawl method - returns list of product data dicts."""
-        products: List[Dict] = []
+        if not self.browser:
+            # This is a fallback, the main app should call start/stop
+            await self.start()
 
-        # STEP 1: Discover product URLs (basic pagination via links)
+        products: List[Dict] = []
+        
+        # STEP 1: Discover product URLs (with Playwright for dynamic content)
         await self._discover_products(start_url)
 
         # STEP 2: Extract data from each product
+        # Use a new page for each product to prevent state leakage
         for i, product_url in enumerate(list(self.product_urls)[: self.max_products]):
             product_data = await self._extract_product(product_url)
             if product_data:
@@ -63,83 +60,99 @@ class UniversalCrawler:
 
     async def _discover_products(self, listing_url: str):
         """
-        SOW 2.3.A - Find product URLs using hybrid strategy with improved pagination.
+        SOW 2.3.A - Find product URLs using hybrid strategy with Playwright.
+        Handles pagination and best-effort infinite scroll.
         """
+        if not self.browser:
+            return
+
+        page = await self.browser.new_page()
         current_url = listing_url
-        page_num = 1
+        page_count = 0
 
-        for _ in range(min(self.max_pages, 10)):
-            if current_url in self.visited_urls:
-                break
-            self.visited_urls.add(current_url)
+        try:
+            while page_count < self.max_pages:
+                if current_url in self.visited_urls:
+                    break
+                self.visited_urls.add(current_url)
+                page_count += 1
 
-            try:
-                resp = self.session.get(current_url, timeout=20)
-                resp.raise_for_status()
-                soup = BeautifulSoup(resp.text, "html.parser")
+                print(f"Crawling page {page_count}: {current_url}")
+                await page.goto(current_url, wait_until="domcontentloaded", timeout=30000)
+
+                # Best-effort infinite scroll (SOW 2.3.A)
+                await self._handle_infinite_scroll(page)
+
+                # Get the final HTML content after dynamic loading
+                html = await page.content()
+                soup = BeautifulSoup(html, "html.parser")
 
                 self._extract_links_from_page_soup(soup, current_url)
 
-                # Try multiple pagination strategies
-                next_url = None
-
-                # Strategy 1: rel="next" link
-                next_link = soup.select_one('a[rel="next"]')
-                if next_link and next_link.get("href"):
-                    next_url = urljoin(current_url, next_link["href"])
-
-                # Strategy 2: "Next" button/link text
-                if not next_url:
-                    next_link = soup.find("a", string=re.compile(r"next|→|›", re.I))
-                    if next_link and next_link.get("href"):
-                        next_url = urljoin(current_url, next_link["href"])
-
-                # Strategy 3: Common pagination URL patterns
-                if not next_url:
-                    page_num += 1
-                    # Try ?page=N
-                    if "?" in listing_url:
-                        next_url = re.sub(r"page=\d+", f"page={page_num}", listing_url)
-                        if next_url == listing_url:
-                            next_url = f"{listing_url}&page={page_num}"
-                    else:
-                        next_url = f"{listing_url}?page={page_num}"
-
-                    # Try /page/N pattern
-                    if "/page/" not in next_url:
-                        base = listing_url.rstrip("/")
-                        next_url = f"{base}/page/{page_num}"
-
+                # Check for pagination links
+                next_url = self._find_next_page_url(soup, current_url, page_count)
+                
                 if next_url and next_url not in self.visited_urls:
                     current_url = next_url
                 else:
                     break
+        except Exception as e:
+            print(f"Error discovering products from {current_url}: {e}")
+        finally:
+            await page.close()
 
-            except Exception as e:
-                print(f"Error discovering products from {current_url}: {e}")
-                break
+    async def _handle_infinite_scroll(self, page: Page, scroll_limit: int = 3):
+        """Scroll down a few times to trigger infinite loading."""
+        for i in range(scroll_limit):
+            # Scroll to the bottom of the page
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            # Wait for content to load (adjust as needed)
+            await asyncio.sleep(1.5)
+            print(f"  -> Scrolled down {i+1}/{scroll_limit} times.")
+
+    def _find_next_page_url(self, soup: BeautifulSoup, current_url: str, current_page_num: int) -> str:
+        """Find the next page URL using various heuristics."""
+        # Strategy 1: rel="next" link
+        next_link = soup.select_one('a[rel="next"]')
+        if next_link and next_link.get("href"):
+            return urljoin(current_url, next_link["href"])
+
+        # Strategy 2: "Next" button/link text
+        next_link = soup.find("a", string=re.compile(r"next|→|›", re.I))
+        if next_link and next_link.get("href"):
+            return urljoin(current_url, next_link["href"])
+
+        # Strategy 3: Common pagination URL patterns (e.g., ?page=N+1)
+        parsed_url = urlparse(current_url)
+        
+        # Try to increment a 'page' parameter
+        if 'page=' in parsed_url.query:
+            next_page_num = current_page_num + 1
+            query = re.sub(r"page=\d+", f"page={next_page_num}", parsed_url.query)
+            return parsed_url._replace(query=query).geturl()
+        
+        # Try to increment a path segment like /page/N+1
+        if re.search(r"/page/\d+", parsed_url.path):
+            next_page_num = current_page_num + 1
+            path = re.sub(r"/page/\d+", f"/page/{next_page_num}", parsed_url.path)
+            return parsed_url._replace(path=path).geturl()
+
+        return None
 
     def _extract_links_from_page_soup(self, soup: BeautifulSoup, base_url: str):
         """Extract product links using heuristics from static HTML soup."""
-        # SOW 2.3.A Fix: Use a more robust selector for product links on common e-commerce platforms (e.g., Shopify)
-        # Look for links that contain '/products/' in their href.
-        # Also look for common product card selectors like 'grid__item' or 'product-card'
-        
         product_links = set()
         
         # Strategy 1: Find all links that contain '/products/'
-        for a in soup.find_all("a", href=re.compile(r"/products/", re.I)):
+        for a in soup.find_all("a", href=re.compile(r"/products/|/online-pharmacy/p/", re.I)):
             href = a["href"]
-            # Skip obvious non-product links (e.g., links to collections/pages that contain 'products' in the name)
             if any(skip in href.lower() for skip in ["page=", "sort=", "filter=", "category="]):
                 continue
             
             full_url = urljoin(base_url, href)
             product_links.add(full_url)
 
-        # Strategy 2: Find links within common product card elements (if Strategy 1 is not enough)
-        # This is often redundant if Strategy 1 works, but kept for robustness.
-        # Common Shopify/e-commerce product card classes: 'grid__item', 'product-card', 'product-item'
+        # Strategy 2: Find links within common product card elements
         for card in soup.find_all(class_=re.compile(r"product-card|grid__item|product-item", re.I)):
             link = card.find("a", href=re.compile(r"/products/", re.I))
             if link and link.get("href"):
@@ -149,11 +162,14 @@ class UniversalCrawler:
         self.product_urls.update(product_links)
 
     async def _extract_product(self, product_url: str) -> Dict:
-        """SOW 2.3.B - Extract product data from static product page."""
+        """SOW 2.3.B - Extract product data from product page using Playwright."""
+        if not self.browser:
+            return None
+            
+        page = await self.browser.new_page()
         try:
-            resp = self.session.get(product_url, timeout=20)
-            resp.raise_for_status()
-            html = resp.text
+            await page.goto(product_url, wait_until="domcontentloaded", timeout=30000)
+            html = await page.content()
             soup = BeautifulSoup(html, "html.parser")
 
             product = {
@@ -171,19 +187,19 @@ class UniversalCrawler:
 
             # METHOD 1: JSON-LD
             product_data = self._extract_json_ld(soup)
-            if product_data:
+            if product_data and product_data.get("title"):
                 product.update(product_data)
                 return product
 
             # METHOD 2: Embedded JSON (window state, NEXT_DATA, etc.)
             product_data = self._extract_embedded_json(soup, html)
-            if product_data:
+            if product_data and product_data.get("title"):
                 product.update(product_data)
                 return product
 
             # METHOD 3: DOM heuristics
             product_data = self._extract_dom_heuristics(soup)
-            if product_data:
+            if product_data and product_data.get("title"):
                 product.update(product_data)
                 return product
 
@@ -191,6 +207,8 @@ class UniversalCrawler:
         except Exception as e:
             print(f"Error extracting {product_url}: {e}")
             return None
+        finally:
+            await page.close()
 
     def _extract_json_ld(self, soup: BeautifulSoup) -> Dict:
         """Extract from schema.org JSON-LD."""
@@ -217,8 +235,15 @@ class UniversalCrawler:
     def _extract_product_from_jsonld_item(self, data: Dict) -> Dict:
         if not isinstance(data, dict):
             return None
-        if data.get("@type") not in {"Product", "product"}:
+        # Check for Product or Offer type
+        if data.get("@type") not in {"Product", "product", "Offer", "offer"}:
             return None
+        
+        # If it's an Offer, try to find the parent Product
+        if data.get("@type") in {"Offer", "offer"} and data.get("itemOffered"):
+            data = data.get("itemOffered")
+            if not isinstance(data, dict) or data.get("@type") not in {"Product", "product"}:
+                return None
 
         images = []
         img_field = data.get("image")
@@ -264,7 +289,11 @@ class UniversalCrawler:
             match = re.search(pattern, html_text, re.DOTALL)
             if match:
                 try:
-                    data = json.loads(match.group(1))
+                    # Clean up the matched string before loading JSON
+                    json_str = match.group(1).strip()
+                    if json_str.endswith(';'):
+                        json_str = json_str[:-1]
+                    data = json.loads(json_str)
                     return self._extract_from_nested_json(data)
                 except Exception:
                     continue
