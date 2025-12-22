@@ -11,6 +11,8 @@ import math
 import hashlib
 import ipaddress
 from io import BytesIO
+import io
+import csv
 
 import asyncio
 import aiohttp
@@ -21,8 +23,11 @@ from fastapi import (
     Depends,
     BackgroundTasks,
     HTTPException,
+    Header,
+    Response,
 )
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
@@ -52,21 +57,30 @@ Base.metadata.create_all(bind=engine)
 app = FastAPI(title="Ecommerce Crawler API", version="1.0.0")
 
 # --- Security Dependencies ---
-API_KEY = os.getenv("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 ")
+# Read API key from environment; NEVER hard‑code secrets
+API_KEY = os.getenv("OPENAI_API_KEY")
+
 
 def get_api_key(api_key: str = Header(None, alias="X-API-Key")):
+    if not API_KEY:
+        # Optional: relax this in dev if you want
+        raise HTTPException(
+            status_code=500,
+            detail="Server API key not configured",
+        )
     if api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API Key")
     return api_key
 
+
 # Root endpoint for deployment health check
 @app.get("/")
-@app.head("/") # Explicitly allow HEAD requests for health checks
+@app.head("/")  # Explicitly allow HEAD requests for health checks
 async def root():
-    return {"message": "Ecommerce Crawler API is running. Access /docs for API documentation."}
+    return {
+        "message": "Ecommerce Crawler API is running. Access /docs for API documentation."
+    }
 
-# Health check endpoint
-@app.get("/health")
 
 # Health check endpoint
 @app.get("/health")
@@ -75,8 +89,9 @@ async def health_check():
     return {
         "status": "healthy",
         "service": "ecommerce-crawler-api",
-        "version": "1.0.0"
+        "version": "1.0.0",
     }
+
 
 @app.get("/debug-routes")
 async def debug_routes():
@@ -92,7 +107,7 @@ app.add_middleware(
         FRONTEND_URL,
         "http://localhost:5173",  # Local development
         "http://localhost:3000",  # Alternative local port
-        "https://frontend-rymq.onrender.com",  # Production frontend URL from error message
+        "https://frontend-rymq.onrender.com",  # Production frontend URL
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -429,14 +444,11 @@ async def search(
         base_query = base_query.filter(Product.price >= min_price)
     if max_price is not None:
         base_query = base_query.filter(Product.price <= max_price)
-    # Note: Availability filter is currently not implemented in the frontend,
-    # but the backend logic is preserved for future use.
     if availability:
         base_query = base_query.filter(Product.availability.ilike(f"%{availability}%"))
 
     products = base_query.all()
     if not products:
-        # No products stored for this job with the current filters
         return []
 
     product_ids = [p.id for p in products]
@@ -457,9 +469,9 @@ async def search(
             query_vec = await enricher.embed_text(q)
 
             if not query_vec:
-                # Embedding failed, fall back to keyword search
                 print(f"Warning: Embedding generation failed for query: {q}")
             else:
+
                 def cosine(a: List[float], b: List[float]) -> float:
                     if not a or not b:
                         return 0.0
@@ -492,7 +504,6 @@ async def search(
                 scored.sort(reverse=True, key=lambda x: x[0])
         except Exception as e:
             print(f"Error in vector search: {e}. Falling back to keyword search.")
-            # scored will remain empty, triggering keyword fallback below
 
     # Fallback: simple keyword overlap if no vectors / scores
     if not scored:
@@ -512,7 +523,6 @@ async def search(
                 + enrichment_text
             ).lower()
 
-            # If the user supplied a query, prefer products that at least share some words
             if query_words:
                 score = sum(1 for word in query_words if word in search_text)
                 if score > 0:
@@ -522,15 +532,12 @@ async def search(
                     reason = (reason or "")[:200]
                     scored.append((float(score), prod, reason))
             else:
-                # If query is effectively empty, fall back to a neutral score so we still return products
                 reason = (enrichment.visual_summary if enrichment else "") or (
                     prod.description or ""
                 )
                 reason = (reason or "")[:200]
                 scored.append((1.0, prod, reason))
 
-        # If we still have no scored products (e.g. query words not present anywhere),
-        # return all filtered products with a neutral score so the UI never shows an empty grid.
         if not scored:
             for prod in products:
                 enrichment = (
@@ -576,12 +583,10 @@ async def download_search_results(
     """
     Generates a CSV file of the search results based on the current filters.
     """
-    # Use the existing search logic to get the list of products
-    # We pass a very high limit to ensure all products are included
     search_results = await search(
         job_id=job_id,
         q=q,
-        limit=10000, # High limit to get all results
+        limit=10000,  # High limit to get all results
         category=category,
         min_price=min_price,
         max_price=max_price,
@@ -590,13 +595,13 @@ async def download_search_results(
     )
 
     if not search_results:
-        raise HTTPException(status_code=404, detail="No products found matching the criteria.")
+        raise HTTPException(
+            status_code=404, detail="No products found matching the criteria."
+        )
 
-    # Prepare CSV data
     output = io.StringIO()
     writer = csv.writer(output)
 
-    # Write header
     writer.writerow(
         [
             "Title",
@@ -608,20 +613,20 @@ async def download_search_results(
         ]
     )
 
-    # Write product data
     for result in search_results:
         writer.writerow(
             [
                 result.title,
                 result.price,
                 result.source_url,
-                result.description.replace("\n", " ") if result.description else "",
+                result.description.replace("\n", " ")
+                if result.description
+                else "",
                 result.match_reason,
                 result.images[0] if result.images else "",
             ]
         )
 
-    # Return as a FileResponse
     return Response(
         content=output.getvalue(),
         media_type="text/csv",
@@ -644,8 +649,6 @@ async def get_job_categories(job_id: str, db: Session = Depends(get_db)):
         .distinct()
         .all()
     )
-    # The result is a list of tuples, e.g., [('Clothing',), ('Electronics',)]
-    # We flatten it to a list of strings
     return [c[0] for c in categories]
 
 
@@ -683,7 +686,7 @@ async def get_product(product_id: str, db: Session = Depends(get_db)):
 
 async def download_and_store_image(
     session: aiohttp.ClientSession, img_url: str, product_id: str
-) -> Dict:
+) -> Optional[Dict]:
     """
     Downloads an image, calculates its hash, extracts dimensions, and returns metadata.
     For this demo, images are saved to a local 'download' folder inside the backend directory.
@@ -698,19 +701,16 @@ async def download_and_store_image(
             image_bytes = await response.read()
             img_hash = hashlib.md5(image_bytes).hexdigest()
 
-            # Extract image dimensions
             try:
                 img = Image.open(BytesIO(image_bytes))
                 width, height = img.size
             except Exception:
                 width, height = None, None
 
-            # Save to local download folder
             backend_dir = os.path.dirname(__file__)
             download_dir = os.path.join(backend_dir, "download")
             os.makedirs(download_dir, exist_ok=True)
 
-            # Try to infer an extension from the URL, default to .jpg
             ext = ".jpg"
             for candidate in [".jpg", ".jpeg", ".png", ".webp"]:
                 if img_url.lower().endswith(candidate):
@@ -726,8 +726,6 @@ async def download_and_store_image(
                 print(f"Error saving image {img_url} to disk: {e}")
                 file_path = None
 
-            # For the frontend we keep the original URL so images are loadable over HTTP.
-            # The local copy is purely for archival / debugging purposes.
             storage_url = img_url
 
             return {
@@ -768,7 +766,6 @@ async def crawl_and_process(job_id: str, url: str, options: Dict):
 
         products_data = await crawler.crawl(url)
 
-        # Update crawl counters (pages + discovered products)
         job.counters["pages_visited"] = len(crawler.visited_urls)
         job.counters["products_discovered"] = len(products_data)
         db.commit()
@@ -787,7 +784,6 @@ async def crawl_and_process(job_id: str, url: str, options: Dict):
         db.commit()
         await broadcast_status(job_id, db)
 
-        # PHASE 3: DOWNLOAD IMAGES (demo-grade: we persist ProductImage records)
         download_images = options.get("download_images", True)
         if download_images:
             job.status = "downloading"
@@ -811,7 +807,6 @@ async def crawl_and_process(job_id: str, url: str, options: Dict):
                     continue
                 seen_urls.add(src_url)
 
-                # Try to get existing product or create a new one
                 product = (
                     db.query(Product)
                     .filter(Product.source_url == src_url)
@@ -836,16 +831,14 @@ async def crawl_and_process(job_id: str, url: str, options: Dict):
                         db.commit()
                     except IntegrityError:
                         db.rollback()
-                        # Another worker created it concurrently; fetch again
                         product = (
                             db.query(Product)
                             .filter(Product.source_url == src_url)
                             .first()
                         )
                         if not product:
-                            continue  # Skip if still not found
+                            continue
 
-                # Download and store images
                 if download_images:
                     async with aiohttp.ClientSession() as http_session:
                         for img_url in prod_data.get("images", [])[:3]:
@@ -877,7 +870,6 @@ async def crawl_and_process(job_id: str, url: str, options: Dict):
                 db.add(enrichment)
                 db.commit()
 
-                # Create vector embedding for semantic search
                 embedding = await enricher.embed_text(enrichment.enriched_text)
                 if embedding:
                     vector = ProductVector(
@@ -900,7 +892,6 @@ async def crawl_and_process(job_id: str, url: str, options: Dict):
                 )
                 db.rollback()
 
-        # PHASE 5: INDEX (placeholder)
         job.status = "indexing"
         job.counters["products_indexed"] = job.counters.get("products_enriched", 0)
         db.commit()
@@ -912,7 +903,6 @@ async def crawl_and_process(job_id: str, url: str, options: Dict):
             f"Indexing completed for {job.counters['products_indexed']} products",
         )
 
-        # COMPLETE
         job.status = "completed"
         job.finished_at = datetime.utcnow()
         db.commit()
@@ -925,7 +915,6 @@ async def crawl_and_process(job_id: str, url: str, options: Dict):
         db.commit()
         await broadcast_status(job_id, db)
         print(f"Job {job_id} failed: {e}")
-        # Best-effort logging; ignore failures here
         try:
             log_job_event(db, job_id, "ERROR", f"Job failed: {e}")
         except Exception:
