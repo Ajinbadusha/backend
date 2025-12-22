@@ -553,6 +553,24 @@ async def search(
     return results
 
 
+@app.get("/jobs/{job_id}/categories", response_model=List[str])
+async def get_job_categories(job_id: str, db: Session = Depends(get_db)):
+    """
+    Returns a list of unique, non-null categories for a given job.
+    Used to populate the category filter dropdown in the frontend.
+    """
+    categories = (
+        db.query(Product.category)
+        .filter(Product.job_id == job_id)
+        .filter(Product.category.isnot(None))
+        .distinct()
+        .all()
+    )
+    # The result is a list of tuples, e.g., [('Clothing',), ('Electronics',)]
+    # We flatten it to a list of strings
+    return [c[0] for c in categories]
+
+
 @app.get("/products/{product_id}")
 async def get_product(product_id: str, db: Session = Depends(get_db)):
     """
