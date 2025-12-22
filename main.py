@@ -416,11 +416,13 @@ async def search(
     base_query = db.query(Product).filter(Product.job_id == job_id)
 
     if category:
-        base_query = base_query.filter(Product.category.ilike(f"%{category}%"))
+        base_query = base_query.filter(Product.category == category)
     if min_price is not None:
         base_query = base_query.filter(Product.price >= min_price)
     if max_price is not None:
         base_query = base_query.filter(Product.price <= max_price)
+    # Note: Availability filter is currently not implemented in the frontend,
+    # but the backend logic is preserved for future use.
     if availability:
         base_query = base_query.filter(Product.availability.ilike(f"%{availability}%"))
 
