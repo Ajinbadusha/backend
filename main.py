@@ -555,6 +555,74 @@ async def search(
     return results
 
 
+@app.get("/search/download", dependencies=[Depends(get_api_key)])
+async def download_search_results(
+    job_id: str,
+    q: str = "",
+    category: Optional[str] = None,
+    min_price: Optional[float] = None,
+    max_price: Optional[float] = None,
+    availability: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
+    """
+    Generates a CSV file of the search results based on the current filters.
+    """
+    # Use the existing search logic to get the list of products
+    # We pass a very high limit to ensure all products are included
+    search_results = await search(
+        job_id=job_id,
+        q=q,
+        limit=10000, # High limit to get all results
+        category=category,
+        min_price=min_price,
+        max_price=max_price,
+        availability=availability,
+        db=db,
+    )
+
+    if not search_results:
+        raise HTTPException(status_code=404, detail="No products found matching the criteria.")
+
+    # Prepare CSV data
+    output = io.StringIO()
+    writer = csv.writer(output)
+
+    # Write header
+    writer.writerow(
+        [
+            "Title",
+            "Price",
+            "Source URL",
+            "Description",
+            "Match Reason (Semantic/Keyword)",
+            "Image URL (First)",
+        ]
+    )
+
+    # Write product data
+    for result in search_results:
+        writer.writerow(
+            [
+                result.title,
+                result.price,
+                result.source_url,
+                result.description.replace("\n", " ") if result.description else "",
+                result.match_reason,
+                result.images[0] if result.images else "",
+            ]
+        )
+
+    # Return as a FileResponse
+    return Response(
+        content=output.getvalue(),
+        media_type="text/csv",
+        headers={
+            "Content-Disposition": f"attachment; filename=search_results_{job_id}.csv"
+        },
+    )
+
+
 @app.get("/jobs/{job_id}/categories", response_model=List[str])
 async def get_job_categories(job_id: str, db: Session = Depends(get_db)):
     """
