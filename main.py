@@ -49,7 +49,7 @@ from database import (
 )
 from crawler import UniversalCrawler
 from enrichment import AIEnrichment
-# from celery_app import celery  # not used yet
+# from celery_app import celery # not used yet
 
 # Initialize database schema
 Base.metadata.create_all(bind=engine)
@@ -463,8 +463,8 @@ async def search(
         .filter(ProductVector.product_id.in_(product_ids))
         .all()
     )
-    vector_map = {v.product_id: v.embedding for v in vectors if v.embedding}
 
+    vector_map = {v.product_id: v.embedding for v in vectors if v.embedding}
     scored: List[tuple[float, Product, Optional[str]]] = []
 
     if vector_map:
@@ -507,32 +507,62 @@ async def search(
             print(f"Error in vector search: {e}. Falling back to keyword search.")
             scored = []
 
-    # Fallback: simple keyword match if no vectors/scores
+    # Fallback: simple keyword overlap if no vectors / scores
     if not scored:
-        query_lower = q.lower()
+        query_words = [w for w in q.lower().split() if w.strip()]
         for prod in products:
-            haystack = " ".join(
-                [
-                    prod.title or "",
-                    prod.description or "",
-                    prod.category or "",
-                ]
+            enrichment = (
+                db.query(ProductEnrichment)
+                .filter(ProductEnrichment.product_id == prod.id)
+                .first()
+            )
+            enrichment_text = enrichment.enriched_text if enrichment else ""
+            search_text = (
+                (prod.title or "")
+                + " "
+                + (prod.description or "")
+                + " "
+                + enrichment_text
             ).lower()
-            if query_lower in haystack:
-                reason = (prod.description or "")[:200]
+            if query_words:
+                score = sum(1 for word in query_words if word in search_text)
+                if score > 0:
+                    reason = (enrichment.visual_summary if enrichment else "") or (
+                        prod.description or ""
+                    )
+                    reason = (reason or "")[:200]
+                    scored.append((float(score), prod, reason))
+            else:
+                reason = (enrichment.visual_summary if enrichment else "") or (
+                    prod.description or ""
+                )
+                reason = (reason or "")[:200]
                 scored.append((1.0, prod, reason))
 
-    scored = scored[:limit]
+        if not scored:
+            for prod in products:
+                enrichment = (
+                    db.query(ProductEnrichment)
+                    .filter(ProductEnrichment.product_id == prod.id)
+                    .first()
+                )
+                reason = (enrichment.visual_summary if enrichment else "") or (
+                    prod.description or ""
+                )
+                reason = (reason or "")[:200]
+                scored.append((1.0, prod, reason))
+
+        scored.sort(reverse=True, key=lambda x: x[0])
 
     results: List[ProductResponse] = []
-    for _, prod, reason in scored:
-        images = [img.storage_url or img.source_url for img in prod.images]
+
+    for score, prod, reason in scored[:limit]:
         results.append(
             ProductResponse(
                 id=prod.id,
-                title=prod.title or "Untitled",
+                title=prod.title or "Unknown",
                 price=prod.price,
-                images=images,
+                images=[img.storage_url for img in prod.images],
                 source_url=prod.source_url,
                 description=prod.description,
                 match_reason=reason,
@@ -542,20 +572,174 @@ async def search(
     return results
 
 
-@app.get("/jobs/{job_id}/categories")
-async def get_categories(job_id: str, db: Session = Depends(get_db)):
+@app.get("/search/download", dependencies=[Depends(get_api_key)])
+async def download_search_results(
+    job_id: str,
+    q: str = "",
+    category: Optional[str] = None,
+    min_price: Optional[float] = None,
+    max_price: Optional[float] = None,
+    availability: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
     """
-    Return distinct non-null categories for a job.
+    Generates a CSV file of the search results based on the current filters.
     """
-    cats = (
+    search_results = await search(
+        job_id=job_id,
+        q=q,
+        limit=10000,  # High limit to get all results
+        category=category,
+        min_price=min_price,
+        max_price=max_price,
+        availability=availability,
+        db=db,
+    )
+
+    if not search_results:
+        raise HTTPException(
+            status_code=404, detail="No products found matching the criteria."
+        )
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(
+        [
+            "Title",
+            "Price",
+            "Source URL",
+            "Description",
+            "Match Reason (Semantic/Keyword)",
+            "Image URL (First)",
+        ]
+    )
+
+    for result in search_results:
+        writer.writerow(
+            [
+                result.title,
+                result.price,
+                result.source_url,
+                result.description.replace("\n", " ") if result.description else "",
+                result.match_reason,
+                result.images[0] if result.images else "",
+            ]
+        )
+
+    return Response(
+        content=output.getvalue(),
+        media_type="text/csv",
+        headers={
+            "Content-Disposition": f"attachment; filename=search_results_{job_id}.csv"
+        },
+    )
+
+
+@app.get("/jobs/{job_id}/categories", response_model=List[str])
+async def get_job_categories(job_id: str, db: Session = Depends(get_db)):
+    """
+    Returns a list of unique, non-null categories for a given job.
+    Used to populate the category filter dropdown in the frontend.
+    """
+    categories = (
         db.query(Product.category)
-        .filter(Product.job_id == job_id, Product.category.isnot(None))
+        .filter(Product.job_id == job_id)
+        .filter(Product.category.isnot(None))
         .distinct()
         .all()
     )
-    return [c[0] for c in cats]
+    return [c[0] for c in categories]
 
-# ---------- NEW: invoice image generation ----------
+
+@app.get("/products/{product_id}")
+async def get_product(product_id: str, db: Session = Depends(get_db)):
+    """
+    SOW 2.2.A - GET /products/{productId}
+    Get full product record with enrichment
+    """
+    product = db.query(Product).filter(Product.id == product_id).first()
+    if not product:
+        raise HTTPException(status_code=404, detail="Product not found")
+    enrichment = (
+        db.query(ProductEnrichment)
+        .filter(ProductEnrichment.product_id == product_id)
+        .first()
+    )
+
+    return {
+        "id": product.id,
+        "title": product.title,
+        "description": product.description,
+        "price": product.price,
+        "images": [
+            {"url": img.storage_url, "hash": img.hash} for img in product.images
+        ],
+        "enrichment": {
+            "visual_summary": enrichment.visual_summary if enrichment else None,
+            "attributes": enrichment.attributes if enrichment else None,
+        },
+        "source_url": product.source_url,
+    }
+
+
+async def download_and_store_image(
+    session: aiohttp.ClientSession, img_url: str, product_id: str
+) -> Optional[Dict]:
+    """
+    Downloads an image, calculates its hash, extracts dimensions, and returns metadata.
+    For this demo, images are saved to a local 'download' folder inside the backend directory.
+    """
+    try:
+        async with session.get(
+            img_url, timeout=aiohttp.ClientTimeout(total=15)
+        ) as response:
+            if response.status != 200:
+                return None
+
+            image_bytes = await response.read()
+            img_hash = hashlib.md5(image_bytes).hexdigest()
+
+            try:
+                img = Image.open(BytesIO(image_bytes))
+                width, height = img.size
+            except Exception:
+                width, height = None, None
+
+            backend_dir = os.path.dirname(__file__)
+            download_dir = os.path.join(backend_dir, "download")
+            os.makedirs(download_dir, exist_ok=True)
+
+            ext = ".jpg"
+            for candidate in [".jpg", ".jpeg", ".png", ".webp"]:
+                if img_url.lower().endswith(candidate):
+                    ext = candidate
+                    break
+
+            filename = f"{product_id}_{img_hash}{ext}"
+            file_path = os.path.join(download_dir, filename)
+
+            try:
+                with open(file_path, "wb") as f:
+                    f.write(image_bytes)
+            except Exception as e:
+                print(f"Error saving image {img_url} to disk: {e}")
+                file_path = None
+
+            storage_url = img_url
+
+            return {
+                "storage_url": storage_url,
+                "hash": img_hash,
+                "source_url": img_url,
+                "width": width,
+                "height": height,
+            }
+    except Exception as e:
+        print(f"Error downloading image {img_url}: {e}")
+        return None
+
+
+# ---------------- INVOICE IMAGE ENDPOINT (NEW) ----------------
 
 INVOICE_DIR = "invoice_images"
 os.makedirs(INVOICE_DIR, exist_ok=True)
@@ -571,7 +755,6 @@ def generate_invoice_image(product_id: str, db: Session = Depends(get_db)):
     if not product:
         raise HTTPException(status_code=404, detail="Product not found")
 
-    # Need at least one image
     if not product.images:
         raise HTTPException(
             status_code=400, detail="No images available for this product"
@@ -582,7 +765,6 @@ def generate_invoice_image(product_id: str, db: Session = Depends(get_db)):
     if not img_path:
         raise HTTPException(status_code=400, detail="Invalid image path")
 
-    # Open the product image (assumes local path; adjust if using remote URLs)
     try:
         base_image = Image.open(img_path).convert("RGB")
     except Exception as e:
@@ -594,8 +776,6 @@ def generate_invoice_image(product_id: str, db: Session = Depends(get_db)):
     canvas.paste(base_image, (0, 0))
 
     draw = ImageDraw.Draw(canvas)
-
-    # Load fonts or fall back
     try:
         font_title = ImageFont.truetype("arial.ttf", 40)
         font_body = ImageFont.truetype("arial.ttf", 28)
@@ -641,12 +821,194 @@ def generate_invoice_image(product_id: str, db: Session = Depends(get_db)):
     invoice_url = f"/static/{INVOICE_DIR}/{filename}"
     return {"invoice_image_url": invoice_url}
 
-# ---------- existing crawl_and_process and other logic below ----------
 
-async def crawl_and_process(job_id: str, start_url: str, options: Dict):
-    # ... keep your existing crawl/enrich/index implementation unchanged ...
-    # (omitted here for brevity – copy from your current file)
-    ...
+# ---------------- CRAWL & PROCESS (ORIGINAL) ----------------
+
+async def crawl_and_process(job_id: str, url: str, options: Dict):
+    """
+    Main background task - crawl, extract, enrich, index.
+    Runs in-process for demo (FastAPI BackgroundTasks).
+    """
+    db: Session = SessionLocal()
+    try:
+        job = db.query(Job).filter(Job.id == job_id).first()
+        if not job:
+            return
+
+        log_job_event(db, job_id, "INFO", f"Starting crawl for {url}")
+
+        # PHASE 1: CRAWL
+        job.status = "crawling"
+        job.started_at = datetime.utcnow()
+        db.commit()
+        await broadcast_status(job_id, db)
+
+        crawler = UniversalCrawler(
+            max_pages=options.get("max_pages", 5),
+            max_products=options.get("max_products", 50),
+        )
+
+        products_data = await crawler.crawl(url)
+
+        job.counters["pages_visited"] = len(crawler.visited_urls)
+        job.counters["products_discovered"] = len(products_data)
+        db.commit()
+        await broadcast_status(job_id, db)
+
+        log_job_event(
+            db,
+            job_id,
+            "INFO",
+            f"Discovered {len(products_data)} products from crawl",
+        )
+
+        # PHASE 2: PARSE & EXTRACT
+        job.status = "parsing"
+        job.counters["products_extracted"] = len(products_data)
+        db.commit()
+        await broadcast_status(job_id, db)
+
+        download_images = options.get("download_images", True)
+
+        if download_images:
+            job.status = "downloading"
+            db.commit()
+            await broadcast_status(job_id, db)
+
+        # PHASE 3 & 4: DOWNLOAD IMAGES + ENRICH + INDEX
+        job.status = "enriching"
+        db.commit()
+        await broadcast_status(job_id, db)
+
+        log_job_event(db, job_id, "INFO", "Starting AI enrichment phase")
+        enricher = AIEnrichment()
+        seen_urls = set()
+
+        for prod_data in products_data:
+            try:
+                src_url = prod_data["source_url"]
+                if src_url in seen_urls:
+                    continue
+                seen_urls.add(src_url)
+
+                product = (
+                    db.query(Product)
+                    .filter(Product.source_url == src_url)
+                    .first()
+                )
+
+                if not product:
+                    product = Product(
+                        id=str(uuid.uuid4()),
+                        job_id=job_id,
+                        source_url=src_url,
+                        title=prod_data.get("title", "Unknown"),
+                        description=prod_data.get("description"),
+                        price=prod_data.get("price"),
+                        currency=prod_data.get("currency"),
+                        availability=prod_data.get("availability"),
+                        category=prod_data.get("category"),
+                        raw_json=prod_data,
+                    )
+                    db.add(product)
+                    try:
+                        db.commit()
+                    except IntegrityError:
+                        db.rollback()
+                        product = (
+                            db.query(Product)
+                            .filter(Product.source_url == src_url)
+                            .first()
+                        )
+
+                if not product:
+                    continue
+
+                if download_images:
+                    async with aiohttp.ClientSession() as http_session:
+                        for img_url in prod_data.get("images", [])[:3]:
+                            image_meta = await download_and_store_image(
+                                http_session, img_url, product.id
+                            )
+                            if image_meta:
+                                img_obj = ProductImage(
+                                    id=str(uuid.uuid4()),
+                                    product_id=product.id,
+                                    **image_meta,
+                                )
+                                db.add(img_obj)
+                                job.counters["images_downloaded"] = (
+                                    job.counters.get("images_downloaded", 0) + 1
+                                )
+                                db.commit()
+                                await broadcast_status(job_id, db)
+
+                enrichment_data = await enricher.enrich_product(prod_data)
+                enrichment = ProductEnrichment(
+                    id=str(uuid.uuid4()),
+                    product_id=product.id,
+                    visual_summary=enrichment_data.get("visual_summary"),
+                    attributes=enrichment_data.get("attributes"),
+                    per_image_json=enrichment_data.get("per_image"),
+                    enriched_text=enrichment_data.get("enriched_text"),
+                )
+                db.add(enrichment)
+                db.commit()
+
+                embedding = await enricher.embed_text(enrichment.enriched_text)
+                if embedding:
+                    vector = ProductVector(
+                        id=str(uuid.uuid4()),
+                        product_id=product.id,
+                        embedding=embedding,
+                    )
+                    db.add(vector)
+
+                job.counters["products_enriched"] += 1
+                db.commit()
+                await broadcast_status(job_id, db)
+
+            except Exception as e:
+                print(f"Error enriching product: {e}")
+                log_job_event(
+                    db,
+                    job_id,
+                    "ERROR",
+                    f"Failed to enrich product from {src_url}: {e}",
+                )
+                db.rollback()
+
+        job.status = "indexing"
+        job.counters["products_indexed"] = job.counters.get("products_enriched", 0)
+        db.commit()
+        await broadcast_status(job_id, db)
+
+        log_job_event(
+            db,
+            job_id,
+            "INFO",
+            f"Indexing completed for {job.counters['products_indexed']} products",
+        )
+
+        job.status = "completed"
+        job.finished_at = datetime.utcnow()
+        db.commit()
+        await broadcast_status(job_id, db)
+
+    except Exception as e:
+        job.status = "failed"
+        job.error = str(e)
+        job.finished_at = datetime.utcnow()
+        db.commit()
+        await broadcast_status(job_id, db)
+        print(f"Job {job_id} failed: {e}")
+        try:
+            log_job_event(db, job_id, "ERROR", f"Job failed: {e}")
+        except Exception:
+            pass
+    finally:
+        db.close()
+
 
 if __name__ == "__main__":
     import uvicorn
