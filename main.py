@@ -858,7 +858,7 @@ async def crawl_and_process(job_id: str, url: str, options: Dict):
             f"Discovered {len(products_data)} products from crawl",
         )
 
-         job.status = "parsing"
+        job.status = "parsing"
         job.counters["products_extracted"] = len(products_data)
         db.commit()
         await broadcast_status(job_id, db)
