@@ -14,12 +14,10 @@ from io import BytesIO
 import io
 import csv
 import asyncio
-import aiohttp
-import requests  # NEW
-import os, redis
 
-REDIS_URL = os.getenv("REDIS_URL")
-redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+import aiohttp
+import requests
+import redis.asyncio as redis  # async Redis client
 
 from fastapi import (
     FastAPI,
@@ -30,6 +28,7 @@ from fastapi import (
     HTTPException,
     Header,
     Response,
+    status,
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -55,12 +54,18 @@ from database import (
 from crawler import UniversalCrawler
 from enrichment import AIEnrichment
 
+# ---------- Redis ----------
+
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+redis_client = redis.from_url(REDIS_URL, decode_responses=True)  # connection pool [web:209]
+
 # Initialize database schema
 Base.metadata.create_all(bind=engine)
 
+# FastAPI app
 app = FastAPI(title="Ecommerce Crawler API", version="1.0.0")
 
-# static for invoice images
+# Serve static files (for invoice images etc.)
 app.mount("/static", StaticFiles(directory="."), name="static")
 
 # --- Security ---
@@ -89,10 +94,18 @@ async def root():
 
 @app.get("/health")
 async def health_check():
+    # simple Redis ping (best-effort)
+    ok = True
+    try:
+        await redis_client.set("health-check", "ok", ex=60)
+    except Exception:
+        ok = False
+
     return {
-        "status": "healthy",
+        "status": "healthy" if ok else "degraded",
         "service": "ecommerce-crawler-api",
         "version": "1.0.0",
+        "redis": ok,
     }
 
 
@@ -377,6 +390,56 @@ async def cancel_job(job_id: str, db: Session = Depends(get_db)):
     return {"status": "cancelled"}
 
 
+# ---- Delete jobs and results ----
+
+@app.delete("/jobs/{job_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_job(job_id: str, db: Session = Depends(get_db)):
+    # Delete child records first
+    db.query(ProductVector).filter(
+        ProductVector.product_id.in_(
+            db.query(Product.id).filter(Product.job_id == job_id)
+        )
+    ).delete(synchronize_session=False)
+
+    db.query(ProductEnrichment).filter(
+        ProductEnrichment.product_id.in_(
+            db.query(Product.id).filter(Product.job_id == job_id)
+        )
+    ).delete(synchronize_session=False)
+
+    db.query(ProductImage).filter(
+        ProductImage.product_id.in_(
+            db.query(Product.id).filter(Product.job_id == job_id)
+        )
+    ).delete(synchronize_session=False)
+
+    db.query(Page).filter(Page.job_id == job_id).delete(synchronize_session=False)
+    db.query(Product).filter(Product.job_id == job_id).delete(synchronize_session=False)
+    db.query(JobLog).filter(JobLog.job_id == job_id).delete(synchronize_session=False)
+
+    deleted = db.query(Job).filter(Job.id == job_id).delete(synchronize_session=False)
+
+    if not deleted:
+        db.rollback()
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    db.commit()
+    return
+
+
+@app.delete("/jobs", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_all_jobs(db: Session = Depends(get_db)):
+    db.query(ProductVector).delete(synchronize_session=False)
+    db.query(ProductEnrichment).delete(synchronize_session=False)
+    db.query(ProductImage).delete(synchronize_session=False)
+    db.query(Page).delete(synchronize_session=False)
+    db.query(Product).delete(synchronize_session=False)
+    db.query(JobLog).delete(synchronize_session=False)
+    db.query(Job).delete(synchronize_session=False)
+    db.commit()
+    return
+
+
 @app.get("/search", response_model=List[ProductResponse])
 async def search(
     job_id: str,
@@ -420,6 +483,7 @@ async def search(
             if not query_vec:
                 print(f"Warning: Embedding generation failed for query: {q}")
             else:
+
                 def cosine(a: List[float], b: List[float]) -> float:
                     if not a or not b:
                         return 0.0
@@ -794,7 +858,7 @@ async def crawl_and_process(job_id: str, url: str, options: Dict):
             f"Discovered {len(products_data)} products from crawl",
         )
 
-        job.status = "parsing"
+         job.status = "parsing"
         job.counters["products_extracted"] = len(products_data)
         db.commit()
         await broadcast_status(job_id, db)
