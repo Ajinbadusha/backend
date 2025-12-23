@@ -926,7 +926,7 @@ async def crawl_and_process(job_id: str, url: str, options: Dict):
         job.error = str(e)
         job.finished_at = datetime.utcnow()
         db.commit()
-        await.broadcast_status(job_id, db)
+        await broadcast_status(job_id, db)
         print(f"Job {job_id} failed: {e}")
         try:
             log_job_event(db, job_id, "ERROR", f"Job failed: {e}")
