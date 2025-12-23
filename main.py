@@ -28,11 +28,12 @@ from fastapi import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from fastapi.staticfiles import StaticFiles  # NEW
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
+    # IntegrityError import below
 from sqlalchemy.exc import IntegrityError
-from PIL import Image, ImageDraw, ImageFont  # extended
+from PIL import Image, ImageDraw, ImageFont
 
 from database import (
     Base,
@@ -49,18 +50,16 @@ from database import (
 )
 from crawler import UniversalCrawler
 from enrichment import AIEnrichment
-# from celery_app import celery # not used yet
 
 # Initialize database schema
 Base.metadata.create_all(bind=engine)
 
-# FastAPI app
 app = FastAPI(title="Ecommerce Crawler API", version="1.0.0")
 
-# Serve static files (for invoice images etc.)
+# static for invoice images
 app.mount("/static", StaticFiles(directory="."), name="static")
 
-# --- Security Dependencies ---
+# --- Security ---
 
 API_KEY = os.getenv("OPENAI_API_KEY")
 
@@ -71,7 +70,6 @@ def get_api_key(api_key: str = Header(None, alias="X-API-Key")):
             status_code=500,
             detail="Server API key not configured",
         )
-
     if api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API Key")
     return api_key
@@ -114,6 +112,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# WebSocket connections
 connections: Dict[str, List[WebSocket]] = {}
 
 
@@ -666,8 +665,6 @@ async def download_and_store_image(
         return None
 
 
-# ----------- INVOICE IMAGE ENDPOINT -----------
-
 INVOICE_DIR = "invoice_images"
 os.makedirs(INVOICE_DIR, exist_ok=True)
 
@@ -744,8 +741,6 @@ def generate_invoice_image(product_id: str, db: Session = Depends(get_db)):
     invoice_url = f"/static/{INVOICE_DIR}/{filename}"
     return {"invoice_image_url": invoice_url}
 
-
-# ----------- CRAWL & PROCESS -----------
 
 async def crawl_and_process(job_id: str, url: str, options: Dict):
     """
