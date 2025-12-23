@@ -212,13 +212,16 @@ async def search(
 async def crawl_and_process(job_id: str, url: str, options: Dict):
     db: Session = SessionLocal()
     try:
+        # -------- Load job --------
         job = db.query(Job).filter(Job.id == job_id).first()
         if not job:
             return
 
-        # ---- CRAWLING ----
+        # -------- Phase 1: Crawling --------
         job.status = "crawling"
+        job.started_at = datetime.utcnow()
         db.commit()
+        db.refresh(job)
 
         crawler = UniversalCrawler(
             max_pages=options.get("max_pages", 5),
@@ -227,12 +230,15 @@ async def crawl_and_process(job_id: str, url: str, options: Dict):
 
         products = await crawler.crawl(url)
 
+        # -------- Phase 2: Parsing --------
+        job.status = "parsing"
         job.counters["pages_visited"] = len(crawler.visited_urls)
         job.counters["products_discovered"] = len(products)
-        job.status = "parsing"
         db.commit()
+        db.refresh(job)
 
-        # ---- STORE PRODUCTS ----
+        # -------- Store products --------
+        stored = 0
         for data in products:
             product = Product(
                 id=str(uuid.uuid4()),
@@ -247,25 +253,32 @@ async def crawl_and_process(job_id: str, url: str, options: Dict):
                 raw_json=data,
             )
             db.add(product)
+            stored += 1
 
         db.commit()
 
-        job.counters["products_extracted"] = len(products)
-        job.counters["products_indexed"] = len(products)
+        # -------- Phase 3: Completed --------
         job.status = "completed"
+        job.counters["products_extracted"] = stored
+        job.counters["products_indexed"] = stored
         job.finished_at = datetime.utcnow()
         db.commit()
+        db.refresh(job)
 
     except Exception as e:
-        job.status = "failed"
-        job.error = str(e)
-        job.finished_at = datetime.utcnow()
-        db.commit()
-        print(f"Job {job_id} failed:", e)
+        # -------- Failure path --------
+        try:
+            job.status = "failed"
+            job.error = str(e)
+            job.finished_at = datetime.utcnow()
+            db.commit()
+        except Exception:
+            pass
+
+        print(f"[crawl_and_process] Job {job_id} failed:", e)
 
     finally:
         db.close()
-
 
 # ---------------- RUN ----------------
 
