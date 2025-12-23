@@ -15,6 +15,7 @@ import io
 import csv
 import asyncio
 import aiohttp
+import requests  # NEW
 
 from fastapi import (
     FastAPI,
@@ -31,7 +32,6 @@ from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
-    # IntegrityError import below
 from sqlalchemy.exc import IntegrityError
 from PIL import Image, ImageDraw, ImageFont
 
@@ -671,6 +671,10 @@ os.makedirs(INVOICE_DIR, exist_ok=True)
 
 @app.post("/products/{product_id}/invoice-image")
 def generate_invoice_image(product_id: str, db: Session = Depends(get_db)):
+    """
+    Generate an invoice-style composite image for a product.
+    Downloads the first product image from its remote URL.
+    """
     product = db.query(Product).filter(Product.id == product_id).first()
     if not product:
         raise HTTPException(status_code=404, detail="Product not found")
@@ -681,12 +685,19 @@ def generate_invoice_image(product_id: str, db: Session = Depends(get_db)):
         )
 
     img_meta = product.images[0]
-    img_path = img_meta.storage_url or img_meta.source_url
-    if not img_path:
-        raise HTTPException(status_code=400, detail="Invalid image path")
+    img_url = img_meta.storage_url or img_meta.source_url
+    if not img_url:
+        raise HTTPException(status_code=400, detail="Invalid image URL")
 
+    # download remote image bytes
     try:
-        base_image = Image.open(img_path).convert("RGB")
+        resp = requests.get(img_url, timeout=15)
+        if resp.status_code != 200:
+            raise HTTPException(status_code=502, detail="Failed to fetch product image")
+        image_bytes = resp.content
+        base_image = Image.open(BytesIO(image_bytes)).convert("RGB")
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to open image: {e}")
 
@@ -915,7 +926,7 @@ async def crawl_and_process(job_id: str, url: str, options: Dict):
         job.error = str(e)
         job.finished_at = datetime.utcnow()
         db.commit()
-        await broadcast_status(job_id, db)
+        await.broadcast_status(job_id, db)
         print(f"Job {job_id} failed: {e}")
         try:
             log_job_event(db, job_id, "ERROR", f"Job failed: {e}")
