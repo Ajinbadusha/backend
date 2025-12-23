@@ -57,7 +57,7 @@ from enrichment import AIEnrichment
 # ---------- Redis ----------
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-redis_client = redis.from_url(REDIS_URL, decode_responses=True)  # connection pool [web:209]
+redis_client = redis.from_url(REDIS_URL, decode_responses=True)
 
 # Initialize database schema
 Base.metadata.create_all(bind=engine)
@@ -842,6 +842,7 @@ async def crawl_and_process(job_id: str, url: str, options: Dict):
         crawler = UniversalCrawler(
             max_pages=options.get("max_pages", 5),
             max_products=options.get("max_products", 50),
+            navigation_timeout_ms=60000,  # increased timeout for Render
         )
 
         products_data = await crawler.crawl(url)

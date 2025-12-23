@@ -38,7 +38,17 @@ class UniversalCrawler:
         if self.playwright or self.browser:
             return
         self.playwright = await async_playwright().start()
-        self.browser = await self.playwright.chromium.launch(headless=self.headless)
+        # Use container‑friendly Chromium flags and shorter launch timeout
+        self.browser = await self.playwright.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+            ],
+            timeout=60000,
+        )
 
     async def stop(self):
         """Close the browser and stop Playwright."""
@@ -107,7 +117,10 @@ class UniversalCrawler:
                         "Trying again with no wait_until."
                     )
                     try:
-                        await page.goto(current_url, timeout=self.navigation_timeout_ms)
+                        await page.goto(
+                            current_url,
+                            timeout=self.navigation_timeout_ms,
+                        )
                     except Exception as nav_err2:
                         print(
                             f"[Crawler] Failed to load {current_url} on retry: {nav_err2}"
@@ -167,7 +180,6 @@ class UniversalCrawler:
             return urljoin(current_url, next_link.get("href"))
 
         # Strategy 2: "Next" button/link text
-        # Use attrs.get to avoid KeyError on missing href
         next_link = soup.find("a", string=re.compile(r"next|→|›", re.I))
         if next_link:
             href = next_link.get("href")
@@ -195,27 +207,31 @@ class UniversalCrawler:
         """Extract product links using heuristics from static HTML soup."""
         product_links: Set[str] = set()
 
-        # Strategy 1: Find all links that contain '/products/' or known product paths
+        # Strategy 1: Find all links that look like product URLs
         for a in soup.find_all("a", href=True):
             href = a.get("href")
             if not href:
                 continue
 
-            # Skip obvious non-product / filter URLs
             lower_href = href.lower()
+
+            # Skip obvious non-product / filter URLs
             if any(skip in lower_href for skip in ["sort=", "filter=", "#", "login"]):
                 continue
 
-            if re.search(r"/products/|/online-pharmacy/p/", lower_href):
+            # Match common product patterns including collections/.../products/...
+            if re.search(
+                r"/products/|/collections/.+?/products/|/online-pharmacy/p/",
+                lower_href,
+            ):
                 if any(skip in lower_href for skip in ["page=", "category="]):
-                    # Likely listing/filter URLs
                     continue
                 full_url = urljoin(base_url, href)
                 product_links.add(full_url)
 
         # Strategy 2: Find links within common product card elements
         for card in soup.find_all(
-            class_=re.compile(r"product-card|grid__item|product-item", re.I)
+            class_=re.compile(r"product-card|grid__item|product-item|product", re.I)
         ):
             link = card.find("a", href=True)
             if not link:
@@ -245,10 +261,14 @@ class UniversalCrawler:
             except Exception as nav_err:
                 print(
                     f"[Crawler] Navigation error on product {product_url}: {nav_err}. "
-                    "Retrying without wait_until."
+                    "Retrying with lighter waiting."
                 )
                 try:
-                    await page.goto(product_url, timeout=self.navigation_timeout_ms)
+                    # Relax waiting condition on retry
+                    await page.goto(
+                        product_url,
+                        timeout=self.navigation_timeout_ms,
+                    )
                 except Exception as nav_err2:
                     print(
                         f"[Crawler] Failed to load product {product_url} on retry: {nav_err2}"
@@ -327,7 +347,6 @@ class UniversalCrawler:
         # Check for Product or Offer type
         type_field = data.get("@type")
         if isinstance(type_field, list):
-            # Some sites use ["Product","SomeOtherType"]
             if not any(t.lower() in {"product", "offer"} for t in map(str, type_field)):
                 return None
         else:
@@ -391,7 +410,6 @@ class UniversalCrawler:
                 continue
             try:
                 json_str = match.group(1).strip()
-                # Heuristic cleanup of trailing characters
                 json_str = json_str.rstrip(";/ \n\t")
                 data = json.loads(json_str)
                 return self._extract_from_nested_json(data)
