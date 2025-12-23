@@ -57,18 +57,16 @@ Base.metadata.create_all(bind=engine)
 # FastAPI app
 app = FastAPI(title="Ecommerce Crawler API", version="1.0.0")
 
-# Serve static files for generated invoice images
+# Serve static files (for invoice images etc.)
 app.mount("/static", StaticFiles(directory="."), name="static")
 
 # --- Security Dependencies ---
 
-# Read API key from environment; NEVER hard‑code secrets
 API_KEY = os.getenv("OPENAI_API_KEY")
 
 
 def get_api_key(api_key: str = Header(None, alias="X-API-Key")):
     if not API_KEY:
-        # Optional: relax this in dev if you want
         raise HTTPException(
             status_code=500,
             detail="Server API key not configured",
@@ -79,19 +77,16 @@ def get_api_key(api_key: str = Header(None, alias="X-API-Key")):
     return api_key
 
 
-# Root endpoint for deployment health check
 @app.get("/")
-@app.head("/")  # Explicitly allow HEAD requests for health checks
+@app.head("/")
 async def root():
     return {
         "message": "Ecommerce Crawler API is running. Access /docs for API documentation."
     }
 
 
-# Health check endpoint
 @app.get("/health")
 async def health_check():
-    """Health check endpoint for monitoring"""
     return {
         "status": "healthy",
         "service": "ecommerce-crawler-api",
@@ -101,27 +96,24 @@ async def health_check():
 
 @app.get("/debug-routes")
 async def debug_routes():
-    """Debug endpoint to list all registered routes"""
     return [{"path": r.path, "methods": r.methods, "name": r.name} for r in app.routes]
 
 
-# CORS for frontend - Updated for production
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         FRONTEND_URL,
-        "http://localhost:5173",  # Local development
-        "http://localhost:3000",  # Alternative local port
-        "https://frontend-rymq.onrender.com",  # Production frontend URL
+        "http://localhost:5173",
+        "http://localhost:3000",
+        "https://frontend-rymq.onrender.com",
     ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Store WebSocket connections for real-time updates
 connections: Dict[str, List[WebSocket]] = {}
 
 
@@ -133,7 +125,7 @@ class JobCreate(BaseModel):
         "follow_pagination": True,
         "follow_links": True,
         "download_images": True,
-        "crawl_speed": "normal",  # slow, normal, fast
+        "crawl_speed": "normal",
     }
 
 
@@ -163,7 +155,6 @@ class ProductResponse(BaseModel):
 
 
 def log_job_event(db: Session, job_id: str, level: str, message: str):
-    """Add a log entry for a job."""
     log_entry = JobLog(
         id=str(uuid.uuid4()),
         job_id=job_id,
@@ -175,27 +166,20 @@ def log_job_event(db: Session, job_id: str, level: str, message: str):
 
 
 def is_safe_url(url: str) -> bool:
-    """
-    Validate URL to prevent SSRF attacks.
-    Blocks localhost, private IPs, and link-local addresses.
-    """
     try:
         parsed = urlparse(url)
         hostname = parsed.hostname
         if not hostname:
             return False
 
-        # Block localhost-style hosts
         if hostname in {"localhost", "127.0.0.1", "0.0.0.0", "::1"}:
             return False
 
-        # Try to interpret hostname directly as IP
         try:
             ip = ipaddress.ip_address(hostname)
             if ip.is_private or ip.is_loopback or ip.is_link_local:
                 return False
         except ValueError:
-            # Not a literal IP, check common private ranges in hostnames
             if hostname.startswith("192.168.") or hostname.startswith("10.") or hostname.startswith("172."):
                 return False
 
@@ -206,10 +190,6 @@ def is_safe_url(url: str) -> bool:
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket, job_id: str):
-    """
-    WebSocket for live job status.
-    Client connects to: /ws?job_id=
-    """
     await websocket.accept()
     if job_id not in connections:
         connections[job_id] = []
@@ -230,16 +210,13 @@ async def websocket_endpoint(websocket: WebSocket, job_id: str):
                     )
             finally:
                 db.close()
-            await asyncio.sleep(2)  # update every 2 seconds
+            await asyncio.sleep(2)
     except WebSocketDisconnect:
         if job_id in connections and websocket in connections[job_id]:
             connections[job_id].remove(websocket)
 
 
 async def broadcast_status(job_id: str, db: Session):
-    """
-    Broadcast the latest job status and counters to all connected clients.
-    """
     if job_id not in connections:
         return
 
@@ -269,11 +246,6 @@ async def create_job(
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
 ):
-    """
-    SOW 2.2.A - POST /jobs
-    Create new crawl job with basic validation and duplicate detection.
-    """
-    # ---- URL validation & normalization ----
     parsed = urlparse(job_request.url.strip())
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise HTTPException(
@@ -281,25 +253,20 @@ async def create_job(
             detail="Invalid URL. Use http(s)://domain/path",
         )
 
-    # Add SSRF protection
     if not is_safe_url(job_request.url):
         raise HTTPException(
             status_code=400,
             detail="Invalid URL: Cannot crawl internal/private network addresses",
         )
 
-    # Normalize domain (strip www.) and rebuild URL
     netloc = parsed.netloc.lower()
     if netloc.startswith("www."):
         netloc = netloc[4:]
     normalized_url = urlunparse(parsed._replace(netloc=netloc))
 
-    # Update request URL to normalized form
     job_request.url = normalized_url
-
     options = job_request.options or {}
 
-    # ---- Prevent duplicate identical jobs unless force_rerun ----
     force_rerun = bool(options.get("force_rerun", False))
 
     existing = (
@@ -348,9 +315,6 @@ async def create_job(
 
 @app.get("/jobs", response_model=List[JobListItem])
 async def list_jobs(db: Session = Depends(get_db)):
-    """
-    Admin: list recent jobs with basic stats.
-    """
     jobs = db.query(Job).order_by(Job.created_at.desc()).limit(50).all()
     return [
         JobListItem(
@@ -367,10 +331,6 @@ async def list_jobs(db: Session = Depends(get_db)):
 
 @app.get("/jobs/{job_id}")
 async def get_job(job_id: str, db: Session = Depends(get_db)):
-    """
-    SOW 2.2.A - GET /jobs/{jobId}
-    Get job status and counters
-    """
     job = db.query(Job).filter(Job.id == job_id).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -386,10 +346,6 @@ async def get_job(job_id: str, db: Session = Depends(get_db)):
 
 @app.get("/jobs/{job_id}/logs")
 async def get_logs(job_id: str, limit: int = 100, db: Session = Depends(get_db)):
-    """
-    SOW 2.2.A - GET /jobs/{jobId}/logs
-    Return recent log entries for a job.
-    """
     logs = (
         db.query(JobLog)
         .filter(JobLog.job_id == job_id)
@@ -397,8 +353,6 @@ async def get_logs(job_id: str, limit: int = 100, db: Session = Depends(get_db))
         .limit(limit)
         .all()
     )
-
-    # Return logs in chronological order
     return {
         "logs": [
             {
@@ -413,10 +367,6 @@ async def get_logs(job_id: str, limit: int = 100, db: Session = Depends(get_db))
 
 @app.post("/jobs/{job_id}/cancel")
 async def cancel_job(job_id: str, db: Session = Depends(get_db)):
-    """
-    SOW 2.2.A - POST /jobs/{jobId}/cancel
-    Cancel running job (best-effort)
-    """
     job = db.query(Job).filter(Job.id == job_id).first()
     if job:
         job.status = "cancelled"
@@ -435,11 +385,6 @@ async def search(
     availability: Optional[str] = None,
     db: Session = Depends(get_db),
 ):
-    """
-    SOW 2.2.A & 2.6 - GET /search
-    Semantic search using vector embeddings with filter support.
-    Falls back to keyword scoring if vectors are unavailable.
-    """
     base_query = db.query(Product).filter(Product.job_id == job_id)
 
     if category:
@@ -457,13 +402,11 @@ async def search(
 
     product_ids = [p.id for p in products]
 
-    # Try vector-based semantic search first
     vectors = (
         db.query(ProductVector)
         .filter(ProductVector.product_id.in_(product_ids))
         .all()
     )
-
     vector_map = {v.product_id: v.embedding for v in vectors if v.embedding}
     scored: List[tuple[float, Product, Optional[str]]] = []
 
@@ -507,7 +450,6 @@ async def search(
             print(f"Error in vector search: {e}. Falling back to keyword search.")
             scored = []
 
-    # Fallback: simple keyword overlap if no vectors / scores
     if not scored:
         query_words = [w for w in q.lower().split() if w.strip()]
         for prod in products:
@@ -582,13 +524,10 @@ async def download_search_results(
     availability: Optional[str] = None,
     db: Session = Depends(get_db),
 ):
-    """
-    Generates a CSV file of the search results based on the current filters.
-    """
     search_results = await search(
         job_id=job_id,
         q=q,
-        limit=10000,  # High limit to get all results
+        limit=10000,
         category=category,
         min_price=min_price,
         max_price=max_price,
@@ -637,10 +576,6 @@ async def download_search_results(
 
 @app.get("/jobs/{job_id}/categories", response_model=List[str])
 async def get_job_categories(job_id: str, db: Session = Depends(get_db)):
-    """
-    Returns a list of unique, non-null categories for a given job.
-    Used to populate the category filter dropdown in the frontend.
-    """
     categories = (
         db.query(Product.category)
         .filter(Product.job_id == job_id)
@@ -653,10 +588,6 @@ async def get_job_categories(job_id: str, db: Session = Depends(get_db)):
 
 @app.get("/products/{product_id}")
 async def get_product(product_id: str, db: Session = Depends(get_db)):
-    """
-    SOW 2.2.A - GET /products/{productId}
-    Get full product record with enrichment
-    """
     product = db.query(Product).filter(Product.id == product_id).first()
     if not product:
         raise HTTPException(status_code=404, detail="Product not found")
@@ -685,10 +616,6 @@ async def get_product(product_id: str, db: Session = Depends(get_db)):
 async def download_and_store_image(
     session: aiohttp.ClientSession, img_url: str, product_id: str
 ) -> Optional[Dict]:
-    """
-    Downloads an image, calculates its hash, extracts dimensions, and returns metadata.
-    For this demo, images are saved to a local 'download' folder inside the backend directory.
-    """
     try:
         async with session.get(
             img_url, timeout=aiohttp.ClientTimeout(total=15)
@@ -739,7 +666,7 @@ async def download_and_store_image(
         return None
 
 
-# ---------------- INVOICE IMAGE ENDPOINT (NEW) ----------------
+# ----------- INVOICE IMAGE ENDPOINT -----------
 
 INVOICE_DIR = "invoice_images"
 os.makedirs(INVOICE_DIR, exist_ok=True)
@@ -747,10 +674,6 @@ os.makedirs(INVOICE_DIR, exist_ok=True)
 
 @app.post("/products/{product_id}/invoice-image")
 def generate_invoice_image(product_id: str, db: Session = Depends(get_db)):
-    """
-    Generate a composite 'invoice' image for a product (photo + details) and
-    return a URL that the frontend can download directly.
-    """
     product = db.query(Product).filter(Product.id == product_id).first()
     if not product:
         raise HTTPException(status_code=404, detail="Product not found")
@@ -822,13 +745,13 @@ def generate_invoice_image(product_id: str, db: Session = Depends(get_db)):
     return {"invoice_image_url": invoice_url}
 
 
-# ---------------- CRAWL & PROCESS (ORIGINAL) ----------------
+# ----------- CRAWL & PROCESS -----------
 
 async def crawl_and_process(job_id: str, url: str, options: Dict):
     """
     Main background task - crawl, extract, enrich, index.
-    Runs in-process for demo (FastAPI BackgroundTasks).
     """
+    print(f"[crawl_and_process] starting job {job_id} for {url}")
     db: Session = SessionLocal()
     try:
         job = db.query(Job).filter(Job.id == job_id).first()
@@ -837,7 +760,6 @@ async def crawl_and_process(job_id: str, url: str, options: Dict):
 
         log_job_event(db, job_id, "INFO", f"Starting crawl for {url}")
 
-        # PHASE 1: CRAWL
         job.status = "crawling"
         job.started_at = datetime.utcnow()
         db.commit()
@@ -862,7 +784,6 @@ async def crawl_and_process(job_id: str, url: str, options: Dict):
             f"Discovered {len(products_data)} products from crawl",
         )
 
-        # PHASE 2: PARSE & EXTRACT
         job.status = "parsing"
         job.counters["products_extracted"] = len(products_data)
         db.commit()
@@ -875,7 +796,6 @@ async def crawl_and_process(job_id: str, url: str, options: Dict):
             db.commit()
             await broadcast_status(job_id, db)
 
-        # PHASE 3 & 4: DOWNLOAD IMAGES + ENRICH + INDEX
         job.status = "enriching"
         db.commit()
         await broadcast_status(job_id, db)
