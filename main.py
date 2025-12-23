@@ -1,5 +1,5 @@
 """
-FastAPI Backend - REST API + WebSocket
+FastAPI Backend - Ecommerce Crawl Demo (Demo-Safe)
 """
 
 import os
@@ -7,31 +7,17 @@ import uuid
 from datetime import datetime
 from typing import Dict, Optional, List
 from urllib.parse import urlparse, urlunparse
-import math
-import hashlib
 import ipaddress
-from io import BytesIO
-import io
-import csv
-import asyncio
-import aiohttp
 
 from fastapi import (
     FastAPI,
-    WebSocket,
-    WebSocketDisconnect,
     Depends,
     BackgroundTasks,
     HTTPException,
-    Header,
-    Response,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
-from sqlalchemy.exc import IntegrityError
-from PIL import Image, ImageDraw, ImageFont
 
 from database import (
     Base,
@@ -39,40 +25,27 @@ from database import (
     get_db,
     Job,
     Product,
-    ProductImage,
-    ProductEnrichment,
-    ProductVector,
-    Page,
     SessionLocal,
-    JobLog,
 )
 from crawler import UniversalCrawler
-from enrichment import AIEnrichment
 
-# ------------------ INIT ------------------
+# ---------------- INIT ----------------
 
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="Ecommerce Crawler API", version="1.0.0")
-app.mount("/static", StaticFiles(directory="."), name="static")
-
-# ------------------ CORS ------------------
 
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        FRONTEND_URL,
-        "http://localhost:5173",
-        "http://localhost:3000",
-    ],
+    allow_origins=[FRONTEND_URL, "http://localhost:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ------------------ MODELS ------------------
+# ---------------- MODELS ----------------
 
 class JobCreate(BaseModel):
     url: str
@@ -99,15 +72,14 @@ class ProductResponse(BaseModel):
     match_reason: Optional[str]
 
 
-# ------------------ HELPERS ------------------
+# ---------------- HELPERS ----------------
 
 def is_safe_url(url: str) -> bool:
     try:
         parsed = urlparse(url)
-        host = parsed.hostname
-        if not host:
+        if not parsed.hostname:
             return False
-        ip = ipaddress.ip_address(host) if host.replace(".", "").isdigit() else None
+        ip = ipaddress.ip_address(parsed.hostname) if parsed.hostname.replace(".", "").isdigit() else None
         if ip and ip.is_private:
             return False
         return True
@@ -115,14 +87,14 @@ def is_safe_url(url: str) -> bool:
         return False
 
 
-# ------------------ ROOT ------------------
+# ---------------- ROOT ----------------
 
 @app.get("/")
 async def root():
     return {"status": "running"}
 
 
-# ------------------ JOBS ------------------
+# ---------------- JOBS ----------------
 
 @app.post("/jobs", response_model=JobResponse)
 async def create_job(
@@ -134,29 +106,58 @@ async def create_job(
         raise HTTPException(status_code=400, detail="Unsafe URL")
 
     parsed = urlparse(job.url)
-    norm_url = urlunparse(parsed._replace(netloc=parsed.netloc.lower()))
+    normalized_url = urlunparse(parsed._replace(netloc=parsed.netloc.lower()))
 
     job_id = str(uuid.uuid4())
+
     db_job = Job(
         id=job_id,
-        input_url=norm_url,
+        input_url=normalized_url,
         domain=parsed.netloc,
         status="queued",
         counters={
+            "pages_visited": 0,
+            "products_discovered": 0,
             "products_extracted": 0,
-            "products_enriched": 0,
             "products_indexed": 0,
         },
+        created_at=datetime.utcnow(),
     )
+
     db.add(db_job)
     db.commit()
 
-    background_tasks.add_task(crawl_and_process, job_id, norm_url, job.options)
+    background_tasks.add_task(
+        crawl_and_process,
+        job_id,
+        normalized_url,
+        job.options or {},
+    )
 
-    return {"job_id": job_id, "status": "queued", "counters": db_job.counters}
+    return {
+        "job_id": job_id,
+        "status": db_job.status,
+        "counters": db_job.counters,
+    }
 
 
-# ------------------ SEARCH (✅ FIXED) ------------------
+@app.get("/jobs/{job_id}")
+async def get_job(job_id: str, db: Session = Depends(get_db)):
+    job = db.query(Job).filter(Job.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    return {
+        "job_id": job.id,
+        "status": job.status,
+        "counters": job.counters,
+        "created_at": job.created_at,
+        "finished_at": job.finished_at,
+        "error": job.error,
+    }
+
+
+# ---------------- SEARCH (SAFE FALLBACK) ----------------
 
 @app.get("/search", response_model=List[ProductResponse])
 async def search(
@@ -164,41 +165,29 @@ async def search(
     q: str,
     limit: int = 10,
     category: Optional[str] = None,
-    min_price: Optional[float] = None,
-    max_price: Optional[float] = None,
-    availability: Optional[str] = None,
     db: Session = Depends(get_db),
 ):
-    base_query = db.query(Product).filter(Product.job_id == job_id)
+    query = db.query(Product).filter(Product.job_id == job_id)
 
-    # ✅ FIX 1: category-safe filtering
     if category:
-        base_query = base_query.filter(
+        query = query.filter(
             Product.category.isnot(None),
             Product.category.ilike(category),
         )
 
-    if min_price is not None:
-        base_query = base_query.filter(Product.price >= min_price)
-    if max_price is not None:
-        base_query = base_query.filter(Product.price <= max_price)
-    if availability:
-        base_query = base_query.filter(Product.availability.ilike(f"%{availability}%"))
-
-    products = base_query.all()
+    products = query.all()
     if not products:
         return []
 
     scored = []
-    query_words = [w for w in q.lower().split() if w.strip()]
+    words = [w for w in q.lower().split() if w.strip()]
 
-    for prod in products:
-        text = f"{prod.title or ''} {prod.description or ''}".lower()
-        score = sum(1 for w in query_words if w in text)
+    for p in products:
+        text = f"{p.title or ''} {p.description or ''}".lower()
+        score = sum(1 for w in words if w in text)
         if score > 0:
-            scored.append((score, prod))
+            scored.append((score, p))
 
-    # ✅ FIX 2: fallback – NEVER return empty
     if not scored:
         scored = [(1, p) for p in products]
 
@@ -209,7 +198,7 @@ async def search(
             id=p.id,
             title=p.title or "Unknown",
             price=p.price,
-            images=[img.storage_url for img in p.images],
+            images=[],
             source_url=p.source_url,
             description=p.description,
             match_reason="Keyword / fallback match",
@@ -218,11 +207,19 @@ async def search(
     ]
 
 
-# ------------------ BACKGROUND TASK ------------------
+# ---------------- BACKGROUND CRAWL (🔥 FIXED) ----------------
 
 async def crawl_and_process(job_id: str, url: str, options: Dict):
     db: Session = SessionLocal()
     try:
+        job = db.query(Job).filter(Job.id == job_id).first()
+        if not job:
+            return
+
+        # ---- CRAWLING ----
+        job.status = "crawling"
+        db.commit()
+
         crawler = UniversalCrawler(
             max_pages=options.get("max_pages", 5),
             max_products=options.get("max_products", 50),
@@ -230,6 +227,12 @@ async def crawl_and_process(job_id: str, url: str, options: Dict):
 
         products = await crawler.crawl(url)
 
+        job.counters["pages_visited"] = len(crawler.visited_urls)
+        job.counters["products_discovered"] = len(products)
+        job.status = "parsing"
+        db.commit()
+
+        # ---- STORE PRODUCTS ----
         for data in products:
             product = Product(
                 id=str(uuid.uuid4()),
@@ -247,13 +250,24 @@ async def crawl_and_process(job_id: str, url: str, options: Dict):
 
         db.commit()
 
+        job.counters["products_extracted"] = len(products)
+        job.counters["products_indexed"] = len(products)
+        job.status = "completed"
+        job.finished_at = datetime.utcnow()
+        db.commit()
+
     except Exception as e:
+        job.status = "failed"
+        job.error = str(e)
+        job.finished_at = datetime.utcnow()
+        db.commit()
         print(f"Job {job_id} failed:", e)
+
     finally:
         db.close()
 
 
-# ------------------ RUN ------------------
+# ---------------- RUN ----------------
 
 if __name__ == "__main__":
     import uvicorn
