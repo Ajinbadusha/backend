@@ -6,6 +6,7 @@ Handles: pagination, product discovery, extraction, and infinite scroll.
 import json
 import re
 import asyncio
+import random
 from typing import List, Dict, Set, Optional
 from urllib.parse import urljoin, urlparse, urlunparse
 
@@ -21,7 +22,7 @@ class UniversalCrawler:
         max_pages: int = 10,
         max_products: int = 50,
         headless: bool = True,
-        navigation_timeout_ms: int = 30000,
+        navigation_timeout_ms: int = 60000,
     ):
         self.max_pages = max_pages
         self.max_products = max_products
@@ -46,6 +47,7 @@ class UniversalCrawler:
                 "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
+                "--disable-blink-features=AutomationControlled",
             ],
             timeout=60000,
         )
@@ -89,8 +91,10 @@ class UniversalCrawler:
         if not self.browser:
             return
 
-        page = await self.browser.new_page()
-        await page.set_viewport_size({"width": 1280, "height": 720})
+        page = await self.browser.new_page(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
+        await page.set_viewport_size({"width": 1920, "height": 1080})
         current_url = listing_url
         page_count = 0
 
@@ -110,6 +114,8 @@ class UniversalCrawler:
                         wait_until="domcontentloaded",
                         timeout=self.navigation_timeout_ms,
                     )
+                    # Short sleep to allow dynamic content (JS) to hydrate
+                    await asyncio.sleep(2)
                 except Exception as nav_err:
                     # Some sites never fire domcontentloaded; try a best-effort wait
                     print(
@@ -121,6 +127,7 @@ class UniversalCrawler:
                             current_url,
                             timeout=self.navigation_timeout_ms,
                         )
+                        await asyncio.sleep(3)
                     except Exception as nav_err2:
                         print(
                             f"[Crawler] Failed to load {current_url} on retry: {nav_err2}"
@@ -156,7 +163,7 @@ class UniversalCrawler:
             except Exception as e:
                 print(f"[Crawler] Scroll error: {e}")
                 break
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(2.0)
             print(f"  -> Scrolled down {i + 1}/{scroll_limit} times.")
 
     def _normalize_url(self, url: str) -> str:
@@ -180,7 +187,7 @@ class UniversalCrawler:
             return urljoin(current_url, next_link.get("href"))
 
         # Strategy 2: "Next" button/link text
-        next_link = soup.find("a", string=re.compile(r"next|→|›", re.I))
+        next_link = soup.find("a", string=re.compile(r"next|→|›|»", re.I))
         if next_link:
             href = next_link.get("href")
             if href:
@@ -216,22 +223,24 @@ class UniversalCrawler:
             lower_href = href.lower()
 
             # Skip obvious non-product / filter URLs
-            if any(skip in lower_href for skip in ["sort=", "filter=", "#", "login"]):
+            if any(skip in lower_href for skip in ["sort=", "filter=", "#", "login", "signin", "account", "cart"]):
                 continue
 
             # Match common product patterns including collections/.../products/...
+            # Broadened regex to catch more variations like /item/, /p/, /dp/ (Amazon), etc.
             if re.search(
-                r"/products/|/collections/.+?/products/|/online-pharmacy/p/",
+                r"/(products|product|item|p|dp)/",
                 lower_href,
             ):
-                if any(skip in lower_href for skip in ["page=", "category="]):
+                if any(skip in lower_href for skip in ["page=", "category=", "search="]):
                     continue
                 full_url = urljoin(base_url, href)
                 product_links.add(full_url)
 
         # Strategy 2: Find links within common product card elements
+        # Broadened class names
         for card in soup.find_all(
-            class_=re.compile(r"product-card|grid__item|product-item|product", re.I)
+            class_=re.compile(r"product-card|grid__item|product-item|product|listing-item|card", re.I)
         ):
             link = card.find("a", href=True)
             if not link:
@@ -249,8 +258,10 @@ class UniversalCrawler:
         if not self.browser:
             return None
 
-        page = await self.browser.new_page()
-        await page.set_viewport_size({"width": 1280, "height": 720})
+        page = await self.browser.new_page(
+             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
+        await page.set_viewport_size({"width": 1920, "height": 1080})
         try:
             try:
                 await page.goto(
@@ -258,6 +269,7 @@ class UniversalCrawler:
                     wait_until="domcontentloaded",
                     timeout=self.navigation_timeout_ms,
                 )
+                await asyncio.sleep(1) # wait for hydration
             except Exception as nav_err:
                 print(
                     f"[Crawler] Navigation error on product {product_url}: {nav_err}. "
@@ -269,6 +281,7 @@ class UniversalCrawler:
                         product_url,
                         timeout=self.navigation_timeout_ms,
                     )
+                    await asyncio.sleep(2)
                 except Exception as nav_err2:
                     print(
                         f"[Crawler] Failed to load product {product_url} on retry: {nav_err2}"
@@ -378,6 +391,10 @@ class UniversalCrawler:
             offers = offers[0] if offers else {}
 
         price_raw = offers.get("price") or data.get("price")
+        # Handle string prices like "£12.00"
+        if isinstance(price_raw, str):
+             price_raw = re.sub(r"[^0-9\.]", "", price_raw)
+
         try:
             price_val = float(price_raw) if price_raw is not None else None
         except Exception:
@@ -431,6 +448,8 @@ class UniversalCrawler:
             if result["title"]:
                 price = result["price"]
                 try:
+                    if isinstance(price, str):
+                         price = re.sub(r"[^0-9\.]", "", price)
                     result["price"] = float(price) if price is not None else None
                 except Exception:
                     pass
@@ -462,16 +481,25 @@ class UniversalCrawler:
             else:
                 product["title"] = title_tag.get_text(strip=True)
 
+        if not product.get("title"):
+             # Fallback: title class
+             title_tag = soup.find(class_=re.compile(r"title|product-name", re.I))
+             if title_tag:
+                  product["title"] = title_tag.get_text(strip=True)
+
         # Price: look for common price selectors
-        price_tags = soup.find_all(class_=re.compile(r"price", re.I))
-        if price_tags:
-            price_text = price_tags[0].get_text(" ", strip=True)
-            price_match = re.search(r"[\$£€₹]?\s*(\d+\.?\d*)", price_text)
+        price_tags = soup.find_all(class_=re.compile(r"price|amount", re.I))
+        for price_tag in price_tags:
+            price_text = price_tag.get_text(" ", strip=True)
+            # Refined regex to capture number
+            price_match = re.search(r"[\$£€₹]?\s*(\d{1,3}(?:,\d{3})*(?:\.\d+)?)", price_text)
             if price_match:
                 try:
-                    product["price"] = float(price_match.group(1))
+                    price_clean = price_match.group(1).replace(",", "")
+                    product["price"] = float(price_clean)
+                    break
                 except Exception:
-                    pass
+                    continue
 
         # Description
         desc_tag = soup.find(
@@ -479,12 +507,20 @@ class UniversalCrawler:
         )
         if desc_tag:
             product["description"] = desc_tag.get_text(strip=True)[:500]
+        else:
+             # Meta description fallback
+             meta_desc = soup.find("meta", {"name": "description"})
+             if meta_desc:
+                  product["description"] = meta_desc.get("content")
 
         # Images
         images: List[str] = []
-        for img in soup.find_all("img")[:6]:
+        for img in soup.find_all("img")[:10]: # Look at more images
             src = img.get("src") or img.get("data-src") or img.get("data-lazy-src")
             if src and src.startswith("http"):
+                # Filter out small icons or transparent pixels
+                if "icon" in src or "logo" in src or ".svg" in src:
+                     continue
                 images.append(src)
         product["images"] = images
 
