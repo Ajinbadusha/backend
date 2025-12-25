@@ -13,6 +13,21 @@ from urllib.parse import urljoin, urlparse, urlunparse
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright, Browser, Page, Playwright
 
+class UserAgentRotator:
+    """Simple rotator for modern user agents to avoid detection."""
+    
+    AGENTS = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36 Edg/121.0.0.0"
+    ]
+    
+    @classmethod
+    def get_random(cls) -> str:
+        return random.choice(cls.AGENTS)
+
 
 class UniversalCrawler:
     """Crawl any ecommerce site using hybrid extraction strategy with Playwright."""
@@ -92,7 +107,8 @@ class UniversalCrawler:
             return
 
         page = await self.browser.new_page(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            user_agent=UserAgentRotator.get_random(),
+            viewport={"width": 1920, "height": 1080},
         )
         await page.set_viewport_size({"width": 1920, "height": 1080})
         current_url = listing_url
@@ -259,7 +275,8 @@ class UniversalCrawler:
             return None
 
         page = await self.browser.new_page(
-             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            user_agent=UserAgentRotator.get_random(),
+            viewport={"width": 1920, "height": 1080},
         )
         await page.set_viewport_size({"width": 1920, "height": 1080})
         try:
