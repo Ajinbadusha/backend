@@ -1002,6 +1002,8 @@ async def crawl_and_process(job_id: str, url: str, options: Dict):
         except Exception:
             pass
     finally:
+        if crawler:
+            await crawler.stop()
         db.close()
 
 
