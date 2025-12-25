@@ -403,12 +403,32 @@ class UniversalCrawler:
         elif isinstance(img_field, str):
             images.append(img_field)
 
-        offers = data.get("offers") or {}
-        if isinstance(offers, list):
-            offers = offers[0] if offers else {}
+        offers = data.get("offers")
+        price_raw = None
+        currency = None
+        availability = None
 
-        price_raw = offers.get("price") or data.get("price")
-        # Handle string prices like "£12.00"
+        if isinstance(offers, list):
+            # Iterate through offers to find one with a price
+            for offer in offers:
+                if isinstance(offer, dict):
+                     p = offer.get("price")
+                     if p:
+                         price_raw = p
+                         currency = offer.get("priceCurrency")
+                         availability = offer.get("availability")
+                         break
+        elif isinstance(offers, dict):
+            price_raw = offers.get("price")
+            currency = offers.get("priceCurrency")
+            availability = offers.get("availability")
+
+        # Fallback to root level if no offer price found
+        if price_raw is None:
+            price_raw = data.get("price")
+            currency = currency or data.get("priceCurrency")
+
+        # Handle string prices like "£12.00" or "Rs. 1,200"
         if isinstance(price_raw, str):
              price_raw = re.sub(r"[^0-9\.]", "", price_raw)
 
@@ -421,10 +441,10 @@ class UniversalCrawler:
             "title": data.get("name") or data.get("title"),
             "description": data.get("description"),
             "price": price_val,
-            "currency": offers.get("priceCurrency"),
+            "currency": currency,
             "images": images,
             "sku": data.get("sku"),
-            "availability": offers.get("availability"),
+            "availability": availability,
         }
 
     def _extract_embedded_json(
