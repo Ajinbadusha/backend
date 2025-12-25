@@ -919,6 +919,7 @@ async def crawl_and_process(job_id: str, url: str, options: Dict):
                 if not product:
                     continue
 
+                # Save images
                 if download_images:
                     async with aiohttp.ClientSession() as http_session:
                         for img_url in prod_data.get("images", [])[:3]:
@@ -938,38 +939,45 @@ async def crawl_and_process(job_id: str, url: str, options: Dict):
                                 db.commit()
                                 await broadcast_status(job_id, db)
 
-                enrichment_data = await enricher.enrich_product(prod_data)
-                enrichment = ProductEnrichment(
-                    id=str(uuid.uuid4()),
-                    product_id=product.id,
-                    visual_summary=enrichment_data.get("visual_summary"),
-                    attributes=enrichment_data.get("attributes"),
-                    per_image_json=enrichment_data.get("per_image"),
-                    enriched_text=enrichment_data.get("enriched_text"),
-                )
-                db.add(enrichment)
-                db.commit()
-
-                embedding = await enricher.embed_text(enrichment.enriched_text)
-                if embedding:
-                    vector = ProductVector(
+                # AI Enrichment (Isolated to prevent rollback of valid product on AI failure)
+                try:
+                    enrichment_data = await enricher.enrich_product(prod_data)
+                    enrichment = ProductEnrichment(
                         id=str(uuid.uuid4()),
                         product_id=product.id,
-                        embedding=embedding,
+                        visual_summary=enrichment_data.get("visual_summary"),
+                        attributes=enrichment_data.get("attributes"),
+                        per_image_json=enrichment_data.get("per_image"),
+                        enriched_text=enrichment_data.get("enriched_text"),
                     )
-                    db.add(vector)
+                    db.add(enrichment)
+                    db.commit()
 
-                job.counters["products_enriched"] += 1
-                db.commit()
-                await broadcast_status(job_id, db)
+                    embedding = await enricher.embed_text(enrichment.enriched_text)
+                    if embedding:
+                        vector = ProductVector(
+                            id=str(uuid.uuid4()),
+                            product_id=product.id,
+                            embedding=embedding,
+                        )
+                        db.add(vector)
+
+                    job.counters["products_enriched"] += 1
+                    db.commit()
+                    await broadcast_status(job_id, db)
+                except Exception as enrichment_err:
+                    print(f"Enrichment failed for {src_url}: {enrichment_err}")
+                    # Do not rollback the product; just skip enrichment
+                    # We might want to rollback the failed enrichment transaction if any
+                    db.rollback() 
 
             except Exception as e:
-                print(f"Error enriching product: {e}")
+                print(f"Error processing product {src_url}: {e}")
                 log_job_event(
                     db,
                     job_id,
                     "ERROR",
-                    f"Failed to enrich product from {src_url}: {e}",
+                    f"Failed to process product from {src_url}: {e}",
                 )
                 db.rollback()
 
