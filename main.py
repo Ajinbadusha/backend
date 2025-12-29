@@ -3,7 +3,11 @@ FastAPI Backend - REST API + WebSocket
 """
 
 import os
+from dotenv import load_dotenv
 import uuid
+
+# Load environment variables from .env file
+load_dotenv()
 from datetime import datetime
 from typing import Dict, Optional, List
 from urllib.parse import urlparse, urlunparse
@@ -70,7 +74,7 @@ app.mount("/static", StaticFiles(directory="."), name="static")
 
 # --- Security ---
 
-API_KEY = os.getenv("OPENAI_API_KEY")
+API_KEY = os.getenv("GROQ_API_KEY")  # Groq API key for LLM operations
 
 
 def get_api_key(api_key: str = Header(None, alias="X-API-Key")):
